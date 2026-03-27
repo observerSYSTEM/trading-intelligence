@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
+
 from app.api.admin_gold import router as admin_gold_router
 from app.api.admin_autotrade import router as admin_autotrade_router
 from app.api.admin_ingest import router as admin_ingest_router
@@ -29,6 +30,9 @@ from app.api.settings import router as settings_router
 from app.api.signals import router as signals_router
 from app.api.symbols import router as symbols_router
 from app.api.usage import router as usage_router
+from app.api.dev_create_user import router as dev_router
+
+
 
 from app.core.config import settings
 from app.core.middleware import (
@@ -82,7 +86,7 @@ def _all_routers():
         health_router,
     ]
 
-
+app.include_router(dev_router)
 # Register routers
 for _router in _all_routers():
     app.include_router(_router)
