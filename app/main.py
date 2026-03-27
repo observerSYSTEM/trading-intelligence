@@ -4,10 +4,6 @@ import logging
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
-from app.db.base import Base
-from app.db.session import engine
-
-Base.metadata.create_all(bind=engine)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
@@ -33,6 +29,7 @@ from app.api.settings import router as settings_router
 from app.api.signals import router as signals_router
 from app.api.symbols import router as symbols_router
 from app.api.usage import router as usage_router
+
 from app.core.config import settings
 from app.core.middleware import (
     BodySizeLimitMiddleware,
@@ -40,6 +37,7 @@ from app.core.middleware import (
     RequestTimeoutMiddleware,
     SecurityHeadersMiddleware,
 )
+
 from app.services.oracle_scheduler import start_oracle_scheduler, stop_oracle_scheduler
 from app.services.stripe import validate_price_catalog
 
@@ -85,38 +83,62 @@ def _all_routers():
     ]
 
 
+# Register routers
 for _router in _all_routers():
     app.include_router(_router)
 
-# Versioned aliases for inventory clarity; legacy paths remain supported.
+# Versioned API routes
 for _router in _all_routers():
     app.include_router(_router, prefix=settings.API_VERSION_PREFIX)
 
-# Backward-compatible alias for signal ingestion clients that post to /api/signals.
+# Backward compatibility
 app.include_router(signals_router, prefix="/api")
-# Backward-compatible alias for runner clients that post/read from /api/runner/*.
 app.include_router(runner_router, prefix="/api")
 
+
+# Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
     allow_credentials=settings.CORS_ALLOW_CREDENTIALS,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-Runner-Key", "Stripe-Signature", "X-Request-ID"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "X-Runner-Key",
+        "Stripe-Signature",
+        "X-Request-ID",
+    ],
 )
+
 app.add_middleware(
     BodySizeLimitMiddleware,
     default_limit=settings.REQUEST_MAX_BODY_BYTES,
     webhook_limit=settings.WEBHOOK_MAX_BODY_BYTES,
 )
+
 app.add_middleware(RequestTimeoutMiddleware, timeout_seconds=settings.REQUEST_TIMEOUT_SECONDS)
-app.add_middleware(SecurityHeadersMiddleware, hsts_seconds=settings.SECURITY_HSTS_SECONDS, enable_hsts=settings.is_production)
+
+app.add_middleware(
+    SecurityHeadersMiddleware,
+    hsts_seconds=settings.SECURITY_HSTS_SECONDS,
+    enable_hsts=settings.is_production,
+)
+
 app.add_middleware(RequestContextMiddleware)
 
 
+# ✅ STARTUP FIX (THIS IS THE KEY PART)
 @app.on_event("startup")
 def _startup() -> None:
+    # 🔥 CREATE TABLES PROPERLY
+    from app.db.base import Base
+    from app.db.session import engine
+
+    Base.metadata.create_all(bind=engine)
+
     settings.validate_runtime()
+
     if settings.is_production and settings.STRIPE_SECRET_KEY.strip():
         price_checks = validate_price_catalog()
         failures = {plan: status for plan, status in price_checks.items() if status != "ok"}
@@ -124,6 +146,7 @@ def _startup() -> None:
             raise RuntimeError(
                 f"Stripe price/key mode validation failed. Fix STRIPE_PRICE_* for current key mode: {failures}"
             )
+
     if settings.ORACLE_SCHEDULER_IN_API:
         try:
             start_oracle_scheduler()
