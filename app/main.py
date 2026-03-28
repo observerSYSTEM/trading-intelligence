@@ -30,7 +30,7 @@ from app.api.settings import router as settings_router
 from app.api.signals import router as signals_router
 from app.api.symbols import router as symbols_router
 from app.api.usage import router as usage_router
-from app.api.dev_create_user import router as dev_router
+
 
 
 
@@ -86,7 +86,7 @@ def _all_routers():
         health_router,
     ]
 
-app.include_router(dev_router)
+
 # Register routers
 for _router in _all_routers():
     app.include_router(_router)
