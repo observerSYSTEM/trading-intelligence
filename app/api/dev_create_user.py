@@ -6,7 +6,6 @@ from app.db.session import get_db
 from app.db.models import User
 
 router = APIRouter()
-
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
@@ -17,7 +16,8 @@ def create_user(db: Session = Depends(get_db)):
 
     existing = db.query(User).filter(User.email == email).first()
     if existing:
-        return {"message": "User already exists"}
+        db.delete(existing)
+        db.commit()
 
     user = User(
         email=email,
@@ -30,4 +30,8 @@ def create_user(db: Session = Depends(get_db)):
     db.add(user)
     db.commit()
 
-    return {"message": "User created", "email": email, "password": password}
+    return {
+        "message": "User recreated",
+        "email": email,
+        "password": password,
+    }
