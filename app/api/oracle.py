@@ -34,6 +34,7 @@ from app.db.session import get_db
 from app.services.data_provider import get_data_provider
 from app.services.oracle_basic import oracle_from_candle
 from app.services.oracle_snapshot import compute_dual_timeframe_snapshot, regime_from_direction
+from app.services.session_intel import get_symbol_session_context
 from app.services.strategy_matrix import DAILY_BIAS, StrategyMatrixError, validate_symbol_for_strategy
 from app.services.symbol_preferences import get_user_enabled_symbols
 from app.services.telegram import send_telegram_message
@@ -890,6 +891,28 @@ def get_latest_oracle_snapshot(
     data = _base_from_live(live, message=live["reason_basic"])
     data = _merge_targets_snapshot(data, db=db, symbol=symbol_value)
     return _tier_shape(data, plan)
+
+
+@router.get("/session-context")
+def get_oracle_session_context(
+    symbol: str = "GBPJPY",
+    as_of_utc: datetime | None = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    plan = _resolve_plan(db, user)
+    symbol_value = symbol.strip().upper()
+    allowed = allowed_symbols_for_plan(plan)
+    selected = _selected_symbols_for_user(db, user, plan)
+    if symbol_value not in allowed:
+        raise HTTPException(status_code=403, detail=f"Symbol '{symbol_value}' is not available on your tier")
+    if symbol_value not in selected:
+        raise HTTPException(status_code=403, detail=f"Symbol '{symbol_value}' is not enabled in your settings")
+
+    try:
+        return get_symbol_session_context(db, symbol=symbol_value, as_of_utc=as_of_utc)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.get("/snapshot/latest")

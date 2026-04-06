@@ -67,9 +67,11 @@ from app.services.symbol_preferences import get_user_enabled_symbols
 from app.services.signal_publisher import publish_signal
 from app.services.signal_service import find_refreshable_signal, signal_payload_requires_refresh
 from app.services.telegram_alerts import (
+    build_risk_stale_warning_message,
     latest_oracle_alert_context,
     maybe_send_daily_alignment_alert,
     maybe_send_liquidity_target_alert,
+    maybe_send_m15_opportunity_confirmed_alert,
 )
 from app.services.trade_tracker import (
     build_daily_audit_message,
@@ -665,7 +667,7 @@ def _maybe_send_aligned_signal_alert(
     ):
         return {"status": "not_applicable", "reason": "alignment_incomplete"}
 
-    alert_result = maybe_send_daily_alignment_alert(
+    alert_result = maybe_send_m15_opportunity_confirmed_alert(
         symbol=symbol,
         detected_at=detected_at,
         permission_source=permission_source,
@@ -680,6 +682,7 @@ def _maybe_send_aligned_signal_alert(
         zone_target=zone_target,
         sellside=sellside,
         buyside=buyside,
+        active_setup_key=str(meta.get("active_setup_key") or "").strip() or None,
         material_refresh=material_refresh,
     )
     if alert_result.get("status") == "alert_sent":
@@ -1300,18 +1303,36 @@ def _send_daily_permission_degraded_alerts(db, *, symbol: str, reason: str, targ
     skipped = 0
     now_utc = datetime.now(timezone.utc)
     source = "daily_permission_degraded"
+    alert_context = latest_oracle_alert_context(db, symbol=symbol)
+    liquidity_ctx = _latest_liquidity_context(db, symbol=symbol)
+    target_dt = _parse_iso_utc(target_utc)
+    reason_text = reason or "08:01 daily permission degraded."
+    if target_dt is not None:
+        reason_text = f"{reason_text} Expected 08:01 target: {format_london(target_dt)}."
+    warning_text = build_risk_stale_warning_message(
+        symbol=symbol,
+        detected_at=now_utc,
+        permission_source=alert_context.get("permission_source") or "LONDON_0801",
+        permission_stage=alert_context.get("permission_stage") or "OFFICIAL",
+        daily_permission=alert_context.get("daily_permission"),
+        final_allowed=alert_context.get("final_allowed"),
+        h1_confirmation=alert_context.get("h1_confirmation"),
+        m15_opportunity=alert_context.get("m15_opportunity"),
+        confidence=alert_context.get("confidence"),
+        reason=reason_text,
+        magnet=_safe_float(liquidity_ctx.get("magnet_level")),
+        zone_target=_safe_float(liquidity_ctx.get("zone_to_zone_target")),
+        sellside=_safe_float(liquidity_ctx.get("sellside_liquidity")),
+        buyside=_safe_float(liquidity_ctx.get("buyside_liquidity")),
+        risk_state="DEGRADED",
+        freshness=(f"STALE since {format_london(target_dt)}" if target_dt is not None else "STALE"),
+    )
     for user, chat_id, plan in recipients:
         if _already_sent_today(db, user_id=user.id, symbol=symbol, source=source):
             skipped += 1
             continue
-        text = (
-            f"DEGRADED: Daily Permission 08:01 missing ({symbol})\n"
-            f"Reason: {reason}\n"
-            f"Target 08:01 UTC: {target_utc or 'n/a'}\n"
-            f"Time: {format_london(now_utc)} (UTC {now_utc.isoformat()})"
-        )
         try:
-            send_result = send_telegram_message(chat_id, text)
+            send_result = send_telegram_message(chat_id, warning_text)
             message_id = send_result.get("message_id")
             _record_delivery_log(
                 db,
@@ -2806,12 +2827,14 @@ def _send_magnet_update(db, *, symbol: str, reason: str) -> dict[str, int]:
             zone_target=_safe_float(magnet.zone_to_zone_target),
             sellside=_safe_float(magnet.sellside_liquidity),
             buyside=_safe_float(magnet.buyside_liquidity),
+            daily_permission=alert_context.get("daily_permission"),
             permission_source=alert_context.get("permission_source"),
             permission_stage=alert_context.get("permission_stage"),
             final_allowed=alert_context.get("final_allowed"),
             h1_confirmation=alert_context.get("h1_confirmation"),
             m15_opportunity=alert_context.get("m15_opportunity"),
             confidence=_safe_float(alert_context.get("confidence")),
+            risk_state=alert_context.get("risk_state"),
         )
         if alert_result.get("status") == "alert_sent":
             _mark_runner_telegram_sent(db, sent_at=_as_utc(magnet.as_of_utc))

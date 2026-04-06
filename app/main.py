@@ -132,16 +132,16 @@ app.add_middleware(
 app.add_middleware(RequestContextMiddleware)
 
 
-# ✅ STARTUP FIX (THIS IS THE KEY PART)
+# STARTUP FIX
 @app.on_event("startup")
 def _startup() -> None:
-    # 🔥 CREATE TABLES PROPERLY
+    # Validate env before touching the database startup path.
+    settings.validate_runtime()
+
     from app.db.base import Base
     from app.db.session import engine
 
     Base.metadata.create_all(bind=engine)
-
-    settings.validate_runtime()
 
     if settings.is_production and settings.STRIPE_SECRET_KEY.strip():
         price_checks = validate_price_catalog()

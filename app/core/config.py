@@ -2,6 +2,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import field_validator
 from urllib.parse import urlsplit
 
+from app.core.db_url import normalize_database_url
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -133,6 +135,11 @@ class Settings(BaseSettings):
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    @field_validator("DATABASE_URL", mode="before")
+    @classmethod
+    def normalize_database_url_value(cls, value: str | None):
+        return normalize_database_url(value or "")
 
     @property
     def is_production(self) -> bool:

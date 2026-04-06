@@ -279,6 +279,52 @@ def latest_magnet_state(db: Session, *, symbol: str) -> OracleMagnetState | None
     return db.query(OracleMagnetState).filter(OracleMagnetState.symbol == symbol.strip().upper()).first()
 
 
+def _magnet_alert_threshold_for_symbol(symbol: str) -> float:
+    sym = (symbol or "").strip().upper()
+    if sym == "XAUUSD":
+        return 0.30
+    if sym == "BTCUSD":
+        return 30.0
+    if sym == "GBPJPY":
+        return 0.08
+    if sym in {"GBPUSD", "EURUSD"}:
+        return 0.0005
+    return 0.05
+
+
+def _liquidity_levels_changed_meaningfully(
+    *,
+    symbol: str,
+    latest: OracleTargetsSnapshot | None,
+    levels: dict[str, Any],
+) -> bool:
+    if latest is None:
+        return False
+
+    latest_state = latest.magnet_state if isinstance(latest.magnet_state, dict) else {}
+    latest_current = latest_state.get("current") if isinstance(latest_state.get("current"), dict) else {}
+    before_side = str(latest_current.get("side") or "").strip().upper()
+    after_side = str(levels.get("magnet_side") or "").strip().upper()
+    if before_side and after_side and before_side != after_side:
+        return True
+
+    threshold = _magnet_alert_threshold_for_symbol(symbol)
+    before_magnet = _safe_float(latest.magnet_price)
+    after_magnet = _safe_float(levels.get("magnet_price"))
+    if before_magnet is None or after_magnet is None:
+        if before_magnet != after_magnet:
+            return True
+    elif abs(after_magnet - before_magnet) >= threshold:
+        return True
+
+    before_target = _safe_float(latest.zone_to_zone_target)
+    after_target = _safe_float(levels.get("zone_to_zone_target"))
+    if before_target is None or after_target is None:
+        return before_target != after_target
+
+    return abs(after_target - before_target) >= threshold
+
+
 def detect_magnet_hit(
     *,
     magnet_side: str,
@@ -401,6 +447,11 @@ def recompute_targets_snapshot(
 
     levels = _compute_levels(db, symbol=symbol_value, price_mid=price_mid, prefer_side=prefer_side)
     latest = _latest_targets_row(db, symbol=symbol_value, tier=tier_value)
+    should_send_liquidity_alert = (
+        tier_value == "pro"
+        and reason != "magnet_hit"
+        and _liquidity_levels_changed_meaningfully(symbol=symbol_value, latest=latest, levels=levels)
+    )
 
     previous: list[dict[str, Any]] = []
     if latest and isinstance(latest.magnet_state, dict):
@@ -453,6 +504,28 @@ def recompute_targets_snapshot(
         buyside_liquidity=float(levels["buyside_liquidity"]),
         state_json=magnet_state,
     )
+    if should_send_liquidity_alert:
+        try:
+            alert_context = latest_oracle_alert_context(db, symbol=symbol_value)
+            maybe_send_liquidity_target_alert(
+                symbol=symbol_value,
+                as_of_utc=now_utc,
+                reason=str(reason or "").replace("_", " "),
+                magnet=_safe_float(row.magnet_price),
+                zone_target=_safe_float(row.zone_to_zone_target),
+                sellside=_safe_float(row.sellside_liquidity),
+                buyside=_safe_float(row.buyside_liquidity),
+                daily_permission=alert_context.get("daily_permission"),
+                permission_source=alert_context.get("permission_source"),
+                permission_stage=alert_context.get("permission_stage"),
+                final_allowed=alert_context.get("final_allowed"),
+                h1_confirmation=alert_context.get("h1_confirmation"),
+                m15_opportunity=alert_context.get("m15_opportunity"),
+                confidence=_safe_float(alert_context.get("confidence")),
+                risk_state=alert_context.get("risk_state"),
+            )
+        except Exception:
+            logger.exception("liquidity target telegram notify failed symbol=%s reason=%s", symbol_value, reason)
     logger.info(
         "targets computed symbol=%s timeframe=%s tier=%s latest_candle_time=%s computed_at=%s snapshot_id=%s magnet=%s side=%s reason=%s",
         symbol_value,
@@ -554,12 +627,14 @@ def maybe_refresh_targets_on_magnet_hit(
                 zone_target=_safe_float(new_row.zone_to_zone_target),
                 sellside=_safe_float(new_row.sellside_liquidity),
                 buyside=_safe_float(new_row.buyside_liquidity),
+                daily_permission=alert_context.get("daily_permission"),
                 permission_source=alert_context.get("permission_source"),
                 permission_stage=alert_context.get("permission_stage"),
                 final_allowed=alert_context.get("final_allowed"),
                 h1_confirmation=alert_context.get("h1_confirmation"),
                 m15_opportunity=alert_context.get("m15_opportunity"),
                 confidence=_safe_float(alert_context.get("confidence")),
+                risk_state=alert_context.get("risk_state"),
             )
         except Exception:
             logger.exception("pro magnet telegram notify failed symbol=%s", symbol_value)

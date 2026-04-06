@@ -84,6 +84,17 @@ def _float_token(value: float | None) -> str | None:
     return f"{float(value):.5f}"
 
 
+def _magnet_side_token(*, magnet: float | None, sellside: float | None, buyside: float | None) -> str | None:
+    magnet_token = _float_token(magnet)
+    if magnet_token is None:
+        return None
+    if magnet_token == _float_token(sellside):
+        return "SELL"
+    if magnet_token == _float_token(buyside):
+        return "BUY"
+    return None
+
+
 def _format_price(value: float | None) -> str:
     if value is None:
         return "-"
@@ -105,6 +116,147 @@ def _format_london(value: datetime | None) -> str:
     current = _as_utc(value)
     local = current.astimezone(UK_TZ)
     return f"{local:%Y-%m-%d %H:%M:%S} London"
+
+
+def _normalize_text(value: str | None, *, upper: bool = False) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return text.upper() if upper else text
+
+
+def _humanize_reason(value: str | None, *, fallback: str = "-") -> str:
+    text = _normalize_text(value)
+    if not text:
+        return fallback
+    text = " ".join(text.replace("_", " ").split())
+    if not text:
+        return fallback
+    return f"{text[0].upper()}{text[1:]}" if len(text) > 1 else text.upper()
+
+
+def _format_permission_source(permission_source: str | None, permission_stage: str | None) -> str:
+    source_value = _normalize_text(permission_source, upper=True)
+    stage_value = _normalize_text(permission_stage, upper=True)
+    if source_value and stage_value:
+        return f"{source_value} / {stage_value}"
+    return source_value or stage_value or "-"
+
+
+def _derive_freshness(
+    *,
+    detected_at: datetime | None,
+    stale_hint: bool = False,
+    now_utc: datetime | None = None,
+) -> str:
+    if stale_hint:
+        return "STALE"
+    if detected_at is None:
+        return "UNKNOWN"
+    current_time = _as_utc(now_utc)
+    detected_time = _as_utc(detected_at)
+    age_minutes = max(int((current_time - detected_time).total_seconds() // 60), 0)
+    if age_minutes >= 180:
+        state = "STALE"
+    elif age_minutes >= 30:
+        state = "AGING"
+    else:
+        state = "FRESH"
+    return f"{state} ({age_minutes}m old)"
+
+
+def _derive_risk_state(
+    *,
+    final_allowed: str | None,
+    h1_confirmation: str | None,
+    permission_source: str | None,
+    permission_stage: str | None,
+    manipulation_level: str | None = None,
+    permission_alignment: str | None = None,
+    risk_banner: dict | None = None,
+    risk_state: str | None = None,
+) -> str:
+    explicit = _normalize_text(risk_state, upper=True)
+    if explicit:
+        return explicit
+
+    manipulation_value = _normalize_text(manipulation_level, upper=True)
+    if manipulation_value == "HIGH":
+        return "HIGH_MANIPULATION"
+
+    alignment_value = _normalize_text(permission_alignment, upper=True)
+    if alignment_value == "CONFLICT":
+        return "CAUTION"
+
+    banner = risk_banner if isinstance(risk_banner, dict) else {}
+    if bool(banner.get("is_blueprint_day")) or bool(banner.get("volume_spike")):
+        return "ELEVATED"
+
+    final_allowed_value = _normalize_text(final_allowed, upper=True)
+    h1_value = _normalize_text(h1_confirmation, upper=True)
+    source_value = _normalize_text(permission_source, upper=True)
+    stage_value = _normalize_text(permission_stage, upper=True)
+
+    if final_allowed_value == "NO_TRADE":
+        return "NO_TRADE"
+    if (
+        source_value == "LONDON_0801"
+        and stage_value == "OFFICIAL"
+        and final_allowed_value in {"BUY_ONLY", "SELL_ONLY"}
+        and h1_value not in {"CONFIRMED", "NOT_CONFIRMED"}
+    ):
+        return "DAILY_LOCKED"
+    if final_allowed_value in {"BUY_ONLY", "SELL_ONLY"} and h1_value == "CONFIRMED":
+        return "ALIGNED"
+    if final_allowed_value in {"BUY_ONLY", "SELL_ONLY"} and h1_value == "NOT_CONFIRMED":
+        return "WAIT_CONFIRMATION"
+    return "NEUTRAL"
+
+
+def _build_premium_alert_message(
+    *,
+    title: str,
+    symbol: str,
+    detected_at: datetime | None,
+    permission_source: str | None,
+    permission_stage: str | None,
+    daily_permission: str | None,
+    final_allowed: str | None,
+    h1_confirmation: str | None,
+    m15_opportunity: str | None,
+    confidence: float | None,
+    magnet: float | None,
+    zone_target: float | None,
+    sellside: float | None,
+    buyside: float | None,
+    risk_state: str | None,
+    freshness: str | None,
+    reason: str | None,
+) -> str:
+    return "\n".join(
+        [
+            "TRADING INTELLIGENCE ALERT",
+            title.strip(),
+            "",
+            f"Symbol: {symbol.strip().upper()}",
+            f"London Time: {_format_london(detected_at)}",
+            f"Permission Source/Stage: {_format_permission_source(permission_source, permission_stage)}",
+            f"Daily Permission: {_normalize_text(daily_permission, upper=True) or '-'}",
+            f"Final Allowed: {_normalize_text(final_allowed, upper=True) or '-'}",
+            f"H1 Confirmation: {_normalize_text(h1_confirmation, upper=True) or '-'}",
+            f"M15 Opportunity: {_normalize_text(m15_opportunity, upper=True) or '-'}",
+            f"Confidence: {_format_confidence(confidence)}",
+            "",
+            f"Magnet: {_format_price(magnet)}",
+            f"Zone Target: {_format_price(zone_target)}",
+            f"Sellside Liquidity: {_format_price(sellside)}",
+            f"Buyside Liquidity: {_format_price(buyside)}",
+            "",
+            f"Risk State: {_normalize_text(risk_state, upper=True) or '-'}",
+            f"Freshness: {freshness or _derive_freshness(detected_at=detected_at)}",
+            f"Reason: {_humanize_reason(reason)}",
+        ]
+    )
 
 
 def should_send_alert(
@@ -260,6 +412,8 @@ def latest_oracle_alert_context(db: Session, *, symbol: str) -> dict:
         "m15_opportunity": None,
         "confidence": None,
         "reason": None,
+        "risk_state": None,
+        "freshness": None,
     }
 
     permission_row = (
@@ -273,6 +427,11 @@ def latest_oracle_alert_context(db: Session, *, symbol: str) -> dict:
         context["permission_stage"] = str(permission_row.daily_permission_stage or "").strip().upper() or None
         context["permission_source"] = str(permission_row.permission_source or "").strip().upper() or None
         context["reason"] = str(permission_row.reason or "").strip() or None
+        factors = permission_row.factors_json if isinstance(permission_row.factors_json, dict) else {}
+        context["freshness"] = _derive_freshness(
+            detected_at=permission_row.as_of_utc,
+            stale_hint=bool(factors.get("missing_data")) or bool(factors.get("future_timestamp")),
+        )
 
     latest_run = (
         db.query(OracleRun)
@@ -296,6 +455,26 @@ def latest_oracle_alert_context(db: Session, *, symbol: str) -> dict:
         reason_value = str(public.get("c1") or "").strip()
         if reason_value:
             context["reason"] = reason_value
+        context["risk_state"] = _derive_risk_state(
+            final_allowed=context["final_allowed"],
+            h1_confirmation=context["h1_confirmation"],
+            permission_source=context["permission_source"],
+            permission_stage=context["permission_stage"],
+            manipulation_level=str(latest_run.manipulation_level or "").strip().upper() or None,
+            permission_alignment=str(public.get("permission_alignment") or "").strip().upper() or None,
+            risk_banner=public.get("risk_banner") if isinstance(public.get("risk_banner"), dict) else None,
+        )
+        context["freshness"] = _derive_freshness(detected_at=latest_run.as_of_utc)
+
+    if not context["risk_state"]:
+        context["risk_state"] = _derive_risk_state(
+            final_allowed=context["final_allowed"] or context["daily_permission"],
+            h1_confirmation=context["h1_confirmation"],
+            permission_source=context["permission_source"],
+            permission_stage=context["permission_stage"],
+        )
+    if not context["freshness"]:
+        context["freshness"] = _derive_freshness(detected_at=permission_row.as_of_utc if permission_row is not None else None)
 
     return context
 
@@ -317,6 +496,8 @@ def maybe_send_daily_alignment_alert(
     sellside: float | None,
     buyside: float | None,
     material_refresh: bool,
+    risk_state: str | None = None,
+    freshness: str | None = None,
 ) -> dict:
     symbol_value = (symbol or "").strip().upper()
     detected_time = _as_utc(detected_at)
@@ -356,22 +537,32 @@ def maybe_send_daily_alignment_alert(
     if not dedupe_check.get("send"):
         return {"status": "alert_skipped_duplicate", **dedupe_check}
 
-    lines = [
-        f"DAILY ALIGNMENT CONFIRMED - {symbol_value}",
-        f"London Time: {_format_london(detected_time)}",
-        f"Permission Source: {permission_source_value} ({permission_stage_value})",
-        f"Daily Permission: {daily_permission_value}",
-        f"Final Allowed: {final_allowed_value}",
-        f"H1 Confirmation: {h1_confirmation_value or '-'}",
-        f"M15 Opportunity: {m15_opportunity_value or '-'}",
-        f"Confidence: {_format_confidence(confidence)}",
-        f"Reason: {reason_value or '-'}",
-        f"Magnet: {_format_price(magnet)}",
-        f"Zone Target: {_format_price(zone_target)}",
-        f"Sellside: {_format_price(sellside)}",
-        f"Buyside: {_format_price(buyside)}",
-    ]
-    if not send_telegram_signal("\n".join(lines)):
+    message = _build_premium_alert_message(
+        title="DAILY ALIGNMENT CONFIRMED",
+        symbol=symbol_value,
+        detected_at=detected_time,
+        permission_source=permission_source_value,
+        permission_stage=permission_stage_value,
+        daily_permission=daily_permission_value,
+        final_allowed=final_allowed_value,
+        h1_confirmation=h1_confirmation_value,
+        m15_opportunity=m15_opportunity_value,
+        confidence=confidence,
+        magnet=magnet,
+        zone_target=zone_target,
+        sellside=sellside,
+        buyside=buyside,
+        risk_state=_derive_risk_state(
+            final_allowed=final_allowed_value,
+            h1_confirmation=h1_confirmation_value,
+            permission_source=permission_source_value,
+            permission_stage=permission_stage_value,
+            risk_state=risk_state,
+        ),
+        freshness=freshness or _derive_freshness(detected_at=detected_time),
+        reason=reason_value or "08:01 daily alignment confirmed.",
+    )
+    if not send_telegram_signal(message):
         return {"status": "alert_failed", **dedupe_check}
 
     record_alert_sent(scope=scope, fingerprint=fingerprint, sent_at=detected_time, payload=fingerprint)
@@ -387,12 +578,15 @@ def maybe_send_liquidity_target_alert(
     zone_target: float | None,
     sellside: float | None,
     buyside: float | None,
+    daily_permission: str | None = None,
     permission_source: str | None = None,
     permission_stage: str | None = None,
     final_allowed: str | None = None,
     h1_confirmation: str | None = None,
     m15_opportunity: str | None = None,
     confidence: float | None = None,
+    risk_state: str | None = None,
+    freshness: str | None = None,
 ) -> dict:
     symbol_value = (symbol or "").strip().upper()
     detected_time = _as_utc(as_of_utc)
@@ -408,6 +602,7 @@ def maybe_send_liquidity_target_alert(
 
     fingerprint = {
         "symbol": symbol_value,
+        "magnet_side": _magnet_side_token(magnet=magnet, sellside=sellside, buyside=buyside),
         "magnet": _float_token(magnet),
         "zone_target": _float_token(zone_target),
     }
@@ -421,37 +616,174 @@ def maybe_send_liquidity_target_alert(
     if not dedupe_check.get("send"):
         return {"status": "alert_skipped_duplicate", **dedupe_check}
 
-    lines = [
-        f"LIQUIDITY TARGET UPDATE - {symbol_value}",
-        f"London Time: {_format_london(detected_time)}",
-    ]
-    if permission_source_value:
-        source_text = permission_source_value
-        if permission_stage_value:
-            source_text = f"{source_text} ({permission_stage_value})"
-        lines.append(f"Permission Source: {source_text}")
-    if final_allowed_value:
-        lines.append(f"Final Allowed: {final_allowed_value}")
-    if h1_confirmation_value:
-        lines.append(f"H1 Confirmation: {h1_confirmation_value}")
-    if m15_opportunity_value:
-        lines.append(f"M15 Opportunity: {m15_opportunity_value}")
-    if confidence is not None:
-        lines.append(f"Confidence: {_format_confidence(confidence)}")
-    lines.extend(
-        [
-            f"Reason: {reason_value or '-'}",
-            f"Magnet: {_format_price(magnet)}",
-            f"Zone Target: {_format_price(zone_target)}",
-            f"Sellside: {_format_price(sellside)}",
-            f"Buyside: {_format_price(buyside)}",
-        ]
+    message = _build_premium_alert_message(
+        title="LIQUIDITY TARGET UPDATE",
+        symbol=symbol_value,
+        detected_at=detected_time,
+        permission_source=permission_source_value,
+        permission_stage=permission_stage_value,
+        daily_permission=daily_permission,
+        final_allowed=final_allowed_value,
+        h1_confirmation=h1_confirmation_value,
+        m15_opportunity=m15_opportunity_value,
+        confidence=confidence,
+        magnet=magnet,
+        zone_target=zone_target,
+        sellside=sellside,
+        buyside=buyside,
+        risk_state=_derive_risk_state(
+            final_allowed=final_allowed_value,
+            h1_confirmation=h1_confirmation_value,
+            permission_source=permission_source_value,
+            permission_stage=permission_stage_value,
+            risk_state=risk_state,
+        ),
+        freshness=freshness or _derive_freshness(detected_at=detected_time),
+        reason=reason_value or "Liquidity magnet or zone target changed.",
     )
-    if not send_telegram_signal("\n".join(lines)):
+    if not send_telegram_signal(message):
         return {"status": "alert_failed", **dedupe_check}
 
     record_alert_sent(scope=scope, fingerprint=fingerprint, sent_at=detected_time, payload=fingerprint)
     return {"status": "alert_sent", **dedupe_check}
+
+
+def maybe_send_m15_opportunity_confirmed_alert(
+    *,
+    symbol: str,
+    detected_at: datetime | None,
+    permission_source: str | None,
+    permission_stage: str | None,
+    daily_permission: str | None,
+    final_allowed: str | None,
+    h1_confirmation: str | None,
+    m15_opportunity: str | None,
+    confidence: float | None,
+    reason: str | None,
+    magnet: float | None,
+    zone_target: float | None,
+    sellside: float | None,
+    buyside: float | None,
+    material_refresh: bool,
+    risk_state: str | None = None,
+    freshness: str | None = None,
+    active_setup_key: str | None = None,
+) -> dict:
+    symbol_value = (symbol or "").strip().upper()
+    detected_time = _as_utc(detected_at)
+    permission_source_value = (permission_source or "").strip().upper()
+    permission_stage_value = (permission_stage or "").strip().upper()
+    daily_permission_value = (daily_permission or "").strip().upper()
+    final_allowed_value = (final_allowed or "").strip().upper()
+    h1_confirmation_value = (h1_confirmation or "").strip().upper()
+    m15_opportunity_value = (m15_opportunity or "").strip().upper()
+    reason_value = (reason or "").strip()
+
+    if not (
+        final_allowed_value in {"BUY_ONLY", "SELL_ONLY"}
+        and h1_confirmation_value == "CONFIRMED"
+        and m15_opportunity_value in {"BUY_ONLY", "SELL_ONLY"}
+    ):
+        return {"status": "not_applicable", "reason": "opportunity_incomplete"}
+
+    fingerprint = {
+        "symbol": symbol_value,
+        "signal_type": "opportunity_m15_confirmed",
+        "permission_source": permission_source_value,
+        "permission_stage": permission_stage_value,
+        "daily_permission": daily_permission_value,
+        "final_allowed": final_allowed_value,
+        "h1_confirmation": h1_confirmation_value,
+        "m15_opportunity": m15_opportunity_value,
+        "date_uk": detected_time.astimezone(UK_TZ).date().isoformat(),
+        "active_setup_key": _normalize_text(active_setup_key) or "",
+    }
+    scope = f"{symbol_value}::m15_opportunity_confirmed"
+    dedupe_check = should_send_alert(
+        scope=scope,
+        fingerprint=fingerprint,
+        material_refresh=False,
+        now_utc=detected_time,
+    )
+    if not dedupe_check.get("send"):
+        return {"status": "alert_skipped_duplicate", **dedupe_check}
+
+    message = _build_premium_alert_message(
+        title="M15 OPPORTUNITY CONFIRMED",
+        symbol=symbol_value,
+        detected_at=detected_time,
+        permission_source=permission_source_value,
+        permission_stage=permission_stage_value,
+        daily_permission=daily_permission_value,
+        final_allowed=final_allowed_value,
+        h1_confirmation=h1_confirmation_value,
+        m15_opportunity=m15_opportunity_value,
+        confidence=confidence,
+        magnet=magnet,
+        zone_target=zone_target,
+        sellside=sellside,
+        buyside=buyside,
+        risk_state=_derive_risk_state(
+            final_allowed=final_allowed_value,
+            h1_confirmation=h1_confirmation_value,
+            permission_source=permission_source_value,
+            permission_stage=permission_stage_value,
+            risk_state=risk_state,
+        ),
+        freshness=freshness or _derive_freshness(detected_at=detected_time),
+        reason=reason_value or "M15 opportunity aligned with daily permission and H1 confirmation.",
+    )
+    if not send_telegram_signal(message):
+        return {"status": "alert_failed", **dedupe_check}
+
+    record_alert_sent(scope=scope, fingerprint=fingerprint, sent_at=detected_time, payload=fingerprint)
+    return {"status": "alert_sent", **dedupe_check}
+
+
+def build_risk_stale_warning_message(
+    *,
+    symbol: str,
+    detected_at: datetime | None,
+    permission_source: str | None,
+    permission_stage: str | None,
+    daily_permission: str | None,
+    final_allowed: str | None,
+    h1_confirmation: str | None,
+    m15_opportunity: str | None,
+    confidence: float | None,
+    reason: str | None,
+    magnet: float | None,
+    zone_target: float | None,
+    sellside: float | None,
+    buyside: float | None,
+    risk_state: str | None = None,
+    freshness: str | None = None,
+) -> str:
+    return _build_premium_alert_message(
+        title="RISK / STALE WARNING",
+        symbol=symbol,
+        detected_at=detected_at,
+        permission_source=permission_source,
+        permission_stage=permission_stage,
+        daily_permission=daily_permission,
+        final_allowed=final_allowed,
+        h1_confirmation=h1_confirmation,
+        m15_opportunity=m15_opportunity,
+        confidence=confidence,
+        magnet=magnet,
+        zone_target=zone_target,
+        sellside=sellside,
+        buyside=buyside,
+        risk_state=_derive_risk_state(
+            final_allowed=final_allowed,
+            h1_confirmation=h1_confirmation,
+            permission_source=permission_source,
+            permission_stage=permission_stage,
+            risk_state=risk_state or "DEGRADED",
+        ),
+        freshness=freshness or _derive_freshness(detected_at=detected_at, stale_hint=True),
+        reason=reason,
+    )
 
 
 def send_telegram_signal(message: str) -> bool:
