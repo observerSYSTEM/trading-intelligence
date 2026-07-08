@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, timedelta, timezone
+from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -12,7 +13,7 @@ from app.api.deps import get_current_user, require_admin
 from app.core.rate_limit import RateLimitRule, rate_limit
 from app.api.intel_gold import get_gold_today_pack
 from app.core.config import settings
-from app.core.symbols import allowed_symbols_for_plan, normalize_plan
+from app.core.symbols import allowed_symbols_for_plan, default_configured_symbol, normalize_plan
 from app.db.models import (
     DeliveryLog,
     DailyPermissionSnapshot,
@@ -31,14 +32,16 @@ from app.db.models import (
     WeeklyRangeSnapshot,
 )
 from app.db.session import get_db
-from app.services.data_provider import get_data_provider
+from app.services.data_provider import api_candle_mode, candle_provider_debug_labels, get_data_provider
 from app.services.oracle_basic import oracle_from_candle
+from app.services.oracle_engine import inspect_daily_permission_0801_lookup
 from app.services.oracle_snapshot import compute_dual_timeframe_snapshot, regime_from_direction
 from app.services.session_intel import get_symbol_session_context
 from app.services.strategy_matrix import DAILY_BIAS, StrategyMatrixError, validate_symbol_for_strategy
 from app.services.symbol_preferences import get_user_enabled_symbols
 from app.services.telegram import send_telegram_message
 from app.services.audit import log_audit
+from app.services.time_service import TimeService
 from app.services.usage_service import UsageLimitExceeded, consume_usage, get_usage
 
 router = APIRouter(
@@ -123,6 +126,228 @@ def _latest_daily_permission_snapshot(
     return query.order_by(DailyPermissionSnapshot.as_of_utc.desc(), DailyPermissionSnapshot.created_at.desc()).first()
 
 
+def _provider_source_name(provider) -> str | None:
+    primary = getattr(getattr(provider, "primary", None), "name", None)
+    return str(primary or getattr(provider, "name", "") or "").strip() or None
+
+
+def _provider_fallback_name(provider) -> str | None:
+    fallback = getattr(getattr(provider, "fallback", None), "name", None)
+    return str(fallback or "").strip() or None
+
+
+def _anchor_lookup_provider(provider):
+    primary = getattr(provider, "primary", None)
+    if primary is not None and str(getattr(primary, "name", "") or "").strip().lower() == "oanda":
+        return primary
+    return provider
+
+
+def _anchor_timeframe_delta(timeframe: str) -> timedelta:
+    mapping = {
+        "M1": timedelta(minutes=1),
+        "M5": timedelta(minutes=5),
+        "M15": timedelta(minutes=15),
+    }
+    return mapping[timeframe.strip().upper()]
+
+
+def _complete_candles(candles: list) -> list:
+    return [candle for candle in candles if bool(getattr(candle, "complete", True))]
+
+
+def _candle_contains_target(candle, *, timeframe: str, target_utc: datetime) -> bool:
+    candle_start = _as_utc(candle.time_utc)
+    return candle_start <= target_utc < candle_start + _anchor_timeframe_delta(timeframe)
+
+
+def _probe_latest_api_candle(symbol: str, timeframe: str) -> dict:
+    try:
+        provider = get_data_provider()
+        candle = provider.get_latest_closed_candle(symbol=symbol, timeframe=timeframe)
+        candle_time = _as_utc(candle.time_utc)
+        return {
+            "ok": True,
+            "source": str(getattr(candle, "source", "") or _provider_source_name(provider) or "").strip() or None,
+            "provider": _provider_source_name(provider),
+            "fallback_provider": _provider_fallback_name(provider),
+            "time_utc": candle_time,
+            "time_utc_iso": candle_time.isoformat(),
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "source": None,
+            "provider": None,
+            "fallback_provider": None,
+            "time_utc": None,
+            "time_utc_iso": None,
+            "error": str(exc),
+        }
+
+
+def _probe_api_anchor_candle(symbol: str, *, target_utc: datetime) -> dict:
+    try:
+        raw_provider = get_data_provider()
+    except Exception as exc:
+        logger.warning(
+            "api_anchor_lookup_m1_failed symbol=%s target_utc=%s provider=%s error=%s",
+            symbol,
+            target_utc.isoformat(),
+            None,
+            exc,
+        )
+        return {
+            "ok": False,
+            "status": "fetch_failed",
+            "source": None,
+            "provider": None,
+            "fallback_provider": None,
+            "timeframe": None,
+            "fallback_timeframe": None,
+            "time_utc": None,
+            "time_utc_iso": None,
+            "nearest_time_utc_iso": None,
+            "nearest_delta_seconds": None,
+            "count": 0,
+            "selected_count": 0,
+            "candle": None,
+            "error": str(exc),
+        }
+    provider = _anchor_lookup_provider(raw_provider)
+    provider_name = _provider_source_name(raw_provider) or _provider_source_name(provider)
+    fallback_name = _provider_fallback_name(raw_provider)
+    m1_count = 0
+    nearest = None
+    nearest_delta = None
+    errors: list[str] = []
+
+    def _remember_nearest(candles: list) -> None:
+        nonlocal nearest, nearest_delta
+        if not candles:
+            return
+        candidate = min(
+            candles,
+            key=lambda candle: (
+                abs((_as_utc(candle.time_utc) - target_utc).total_seconds()),
+                _as_utc(candle.time_utc),
+            ),
+        )
+        candidate_delta = int(abs((_as_utc(candidate.time_utc) - target_utc).total_seconds()))
+        if nearest is None or nearest_delta is None or candidate_delta < nearest_delta:
+            nearest = candidate
+            nearest_delta = candidate_delta
+
+    def _ok(candle, *, status: str, timeframe: str, selected_count: int) -> dict:
+        selected_time = _as_utc(candle.time_utc)
+        source = str(getattr(candle, "source", "") or provider_name or "").strip() or None
+        return {
+            "ok": True,
+            "status": status,
+            "source": source,
+            "provider": provider_name,
+            "fallback_provider": fallback_name,
+            "timeframe": timeframe,
+            "fallback_timeframe": timeframe if timeframe != "M1" else None,
+            "time_utc": selected_time,
+            "time_utc_iso": selected_time.isoformat(),
+            "nearest_time_utc_iso": _as_utc(nearest.time_utc).isoformat() if nearest is not None else selected_time.isoformat(),
+            "nearest_delta_seconds": nearest_delta if nearest_delta is not None else 0,
+            "count": m1_count,
+            "selected_count": selected_count,
+            "candle": candle,
+            "error": None,
+        }
+
+    try:
+        m1_candles = _complete_candles(
+            provider.get_candles_range(
+                symbol=symbol,
+                timeframe="M1",
+                start_utc=target_utc - timedelta(minutes=5),
+                end_utc=target_utc + timedelta(minutes=7),
+            )
+        )
+        m1_count = len(m1_candles)
+        _remember_nearest(m1_candles)
+        exact = next((candle for candle in m1_candles if _as_utc(candle.time_utc) == target_utc), None)
+        if exact is not None:
+            return _ok(exact, status="found", timeframe="M1", selected_count=m1_count)
+        logger.warning(
+            "api_anchor_lookup_m1_failed symbol=%s target_utc=%s count=%s provider=%s",
+            symbol,
+            target_utc.isoformat(),
+            m1_count,
+            provider_name,
+        )
+    except Exception as exc:
+        errors.append(f"M1: {exc}")
+        logger.warning(
+            "api_anchor_lookup_m1_failed symbol=%s target_utc=%s provider=%s error=%s",
+            symbol,
+            target_utc.isoformat(),
+            provider_name,
+            exc,
+        )
+
+    for timeframe in ("M5", "M15"):
+        try:
+            delta = _anchor_timeframe_delta(timeframe)
+            candles = _complete_candles(
+                provider.get_candles_range(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    start_utc=target_utc - delta,
+                    end_utc=target_utc + timedelta(seconds=1),
+                )
+            )
+            _remember_nearest(candles)
+            selected = next(
+                (candle for candle in candles if _candle_contains_target(candle, timeframe=timeframe, target_utc=target_utc)),
+                None,
+            )
+            if selected is None:
+                errors.append(f"{timeframe}: no complete candle containing target")
+                continue
+            event_name = f"api_anchor_lookup_{timeframe.lower()}_fallback_ok"
+            logger.info(
+                "%s symbol=%s target_utc=%s candle_time_utc=%s provider=%s source=%s",
+                event_name,
+                symbol,
+                target_utc.isoformat(),
+                _as_utc(selected.time_utc).isoformat(),
+                provider_name,
+                getattr(selected, "source", None),
+            )
+            return _ok(
+                selected,
+                status=f"{timeframe.lower()}_fallback_ok",
+                timeframe=timeframe,
+                selected_count=len(candles),
+            )
+        except Exception as exc:
+            errors.append(f"{timeframe}: {exc}")
+
+    return {
+        "ok": False,
+        "status": "fetch_failed" if errors else "missing",
+        "source": provider_name,
+        "provider": provider_name,
+        "fallback_provider": fallback_name,
+        "timeframe": None,
+        "fallback_timeframe": None,
+        "time_utc": None,
+        "time_utc_iso": None,
+        "nearest_time_utc_iso": _as_utc(nearest.time_utc).isoformat() if nearest is not None else None,
+        "nearest_delta_seconds": nearest_delta,
+        "count": m1_count,
+        "selected_count": 0,
+        "candle": None,
+        "error": "; ".join(errors) if errors else None,
+    }
+
+
 def _daily_permission_health(db: Session, symbol: str, *, now_utc: datetime) -> dict:
     if not UK_TZ_AVAILABLE:
         return {
@@ -149,6 +374,7 @@ def _daily_permission_health(db: Session, symbol: str, *, now_utc: datetime) -> 
         tzinfo=UK_TZ,
     )
     target_utc = target_local.astimezone(timezone.utc)
+    api_mode = api_candle_mode()
 
     row = _latest_daily_permission_snapshot(db, symbol, date_uk=active_date, stage="OFFICIAL")
     prelim_row = _latest_daily_permission_snapshot(db, symbol, date_uk=active_date, stage="PRELIM")
@@ -156,7 +382,7 @@ def _daily_permission_health(db: Session, symbol: str, *, now_utc: datetime) -> 
     factors = row.factors_json if (row and isinstance(row.factors_json, dict)) else {}
     runner_row = db.query(RunnerStatus).order_by(RunnerStatus.updated_at.desc()).first()
     runner_last_error = str(factors.get("runner_last_error") or "").strip() or None
-    if not runner_last_error and runner_row is not None and not bool(runner_row.mt5_connected):
+    if not api_mode and not runner_last_error and runner_row is not None and not bool(runner_row.mt5_connected):
         runner_last_error = str(runner_row.last_error or "").strip() or "Runner MT5 disconnected."
     backfill_attempted = bool(factors.get("backfill_attempted"))
     backfill_result = factors.get("backfill_result") if isinstance(factors.get("backfill_result"), dict) else None
@@ -181,22 +407,45 @@ def _daily_permission_health(db: Session, symbol: str, *, now_utc: datetime) -> 
     if expected_0801_broker_time is None:
         expected_0801_broker_time = target_utc + timedelta(seconds=int(broker_offset_seconds))
     missing = row is None or bool(factors.get("missing_data"))
+    anchor_probe = None
+    if api_mode and missing and now_utc >= target_utc + timedelta(minutes=1):
+        anchor_probe = _probe_api_anchor_candle(symbol, target_utc=target_utc)
+        if anchor_probe.get("ok"):
+            missing = False
+            candle_time_utc = anchor_probe.get("time_utc")
+            actual_candle_found_time = anchor_probe.get("time_utc")
     future = candle_time_utc is not None and candle_time_utc > (now_utc + timedelta(seconds=30))
+    latest_probe = _probe_latest_api_candle(symbol, "M15") if api_mode else None
+    api_feed_fresh = False
+    if api_mode:
+        fresh_threshold_seconds = max(int(settings.RUNNER_HEARTBEAT_STALE_SECONDS or 180), 20 * 60)
+        ingest_freshness_time = None
+        if ingest_row is not None:
+            ingest_freshness_time = getattr(ingest_row, "updated_at", None) or ingest_row.last_ingested_at
+        if ingest_freshness_time is not None:
+            ingest_age_seconds = max(int((now_utc - _as_utc(ingest_freshness_time)).total_seconds()), 0)
+            api_feed_fresh = ingest_age_seconds <= fresh_threshold_seconds
+        if not api_feed_fresh and isinstance(latest_probe, dict) and latest_probe.get("ok"):
+            latest_probe_time = latest_probe.get("time_utc")
+            if isinstance(latest_probe_time, datetime):
+                latest_probe_age_seconds = max(int((now_utc - latest_probe_time).total_seconds()), 0)
+                api_feed_fresh = latest_probe_age_seconds <= fresh_threshold_seconds
 
     degraded = False
     reason = None
     reason_code = None
     if now_local.date() == active_date and (now_local.hour, now_local.minute) >= (8, 20):
         if missing:
-            degraded = True
-            reason = "08:01 candle not available yet."
-            reason_code = "missing_0801"
+            if not (api_mode and api_feed_fresh):
+                degraded = True
+                reason = "08:01 anchor candle not available from API provider." if api_mode else "08:01 candle not available yet."
+                reason_code = "missing_0801"
         elif future:
             degraded = True
             reason = "08:01 candle timestamp is in the future."
             reason_code = "tz_mismatch"
 
-    if row and row.reason and (missing or future):
+    if row and row.reason and (missing or future) and not api_mode:
         reason = row.reason
     if reason and runner_last_error and "runner" not in reason.lower():
         reason = f"{reason} Runner error: {runner_last_error}"
@@ -209,6 +458,24 @@ def _daily_permission_health(db: Session, symbol: str, *, now_utc: datetime) -> 
     elif prelim_row is not None:
         permission_source = str(prelim_row.permission_source or "ASIA").upper()
         permission_as_of = _as_utc(prelim_row.as_of_utc).isoformat()
+    anchor_status = (
+        str(anchor_probe.get("status"))
+        if isinstance(anchor_probe, dict)
+        else ("found" if candle_time_utc is not None and not missing else ("missing" if missing else None))
+    )
+    anchor_source = (
+        str(anchor_probe.get("source"))
+        if isinstance(anchor_probe, dict) and anchor_probe.get("source")
+        else factors.get("anchor_candle_source")
+        or factors.get("nearest_available_candle_source")
+        or factors.get("selection_source")
+    )
+    provider_labels = candle_provider_debug_labels(
+        latest_candle_source=latest_probe.get("source") if isinstance(latest_probe, dict) else None,
+        last_candle_time=latest_probe.get("time_utc_iso") if isinstance(latest_probe, dict) else None,
+        anchor_candle_source=anchor_source,
+        anchor_candle_status=anchor_status,
+    )
     return {
         "timezone": "Europe/London",
         "degraded": degraded,
@@ -227,11 +494,33 @@ def _daily_permission_health(db: Session, symbol: str, *, now_utc: datetime) -> 
         "for_date_uk": active_date.isoformat(),
         "backfill_attempted": backfill_attempted,
         "backfill_result": backfill_result,
+        "requested_symbol": factors.get("requested_symbol"),
+        "resolved_mt5_symbol": factors.get("resolved_mt5_symbol")
+        or (backfill_result.get("resolved_mt5_symbol") if isinstance(backfill_result, dict) else None),
+        "lookup_start_utc": factors.get("lookup_start_utc") or factors.get("search_start_utc"),
+        "lookup_end_utc": factors.get("lookup_end_utc") or factors.get("search_end_utc"),
+        "lookup_start_broker_utc": factors.get("lookup_start_broker_utc") or factors.get("search_start_broker_utc"),
+        "lookup_end_broker_utc": factors.get("lookup_end_broker_utc") or factors.get("search_end_broker_utc"),
+        "m1_candles_returned_utc_window": factors.get("m1_candles_returned_utc_window")
+        or factors.get("candidate_count_utc_window"),
+        "m1_candles_returned_broker_window": factors.get("m1_candles_returned_broker_window")
+        or factors.get("candidate_count_broker_window"),
+        "m1_candles_returned_total": factors.get("m1_candles_returned_total") or factors.get("candidate_count_total"),
+        "nearest_available_candle_time": factors.get("nearest_available_candle_time"),
+        "nearest_available_candle_time_london": factors.get("nearest_available_candle_time_london"),
+        "nearest_available_candle_source": factors.get("nearest_available_candle_source"),
+        "nearest_available_candle_delta_seconds": factors.get("nearest_available_candle_delta_seconds"),
+        "selection_source": factors.get("selection_source"),
+        "selection_tolerance_seconds": factors.get("selection_tolerance_seconds"),
+        "selected_time_delta_seconds": factors.get("selected_time_delta_seconds"),
         "permission_stage": permission_stage,
         "permission_source": permission_source,
         "permission_as_of_utc": permission_as_of,
         "permission_lock_time_london": target_local.isoformat(),
         "runner_last_error": runner_last_error,
+        "api_mode": api_mode,
+        "api_candle_error": latest_probe.get("error") if isinstance(latest_probe, dict) else None,
+        **provider_labels,
     }
 
 
@@ -248,6 +537,274 @@ def _confidence_from_candle(o: float, h: float, l: float, c: float) -> float:
     body = abs(c - o)
     ratio = min(max(body / candle_range, 0.0), 1.0)
     return round(ratio, 4)
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _direction_signal_value(direction: str | None) -> float:
+    value = str(direction or "").strip().upper()
+    if value in {"BUY", "BUY_ONLY", "BULL", "BULLISH", "STRONG BUY"}:
+        return 1.0
+    if value in {"SELL", "SELL_ONLY", "BEAR", "BEARISH", "STRONG SELL"}:
+        return -1.0
+    return 0.0
+
+
+def _direction_label_from_score(score: float) -> str:
+    buy_pct = ((score + 1.0) / 2.0) * 100.0
+    sell_pct = 100.0 - buy_pct
+    if buy_pct >= 72.0:
+        return "STRONG BUY"
+    if buy_pct >= 58.0:
+        return "BUY"
+    if sell_pct >= 72.0:
+        return "STRONG SELL"
+    if sell_pct >= 58.0:
+        return "SELL"
+    return "NEUTRAL"
+
+
+def _round_pct(value: float) -> float:
+    return round(_clamp(value, 0.0, 100.0), 1)
+
+
+def _candle_direction_score(candles: list[Any]) -> float:
+    if len(candles) < 2:
+        return 0.0
+    window = candles[-min(len(candles), 20) :]
+    first = window[0]
+    last = window[-1]
+    first_close = _safe_float(getattr(first, "close", None))
+    last_close = _safe_float(getattr(last, "close", None))
+    last_open = _safe_float(getattr(last, "open", None))
+    last_high = _safe_float(getattr(last, "high", None))
+    last_low = _safe_float(getattr(last, "low", None))
+    if first_close is None or last_close is None:
+        return 0.0
+
+    ranges = [
+        max((_safe_float(getattr(candle, "high", None)) or 0.0) - (_safe_float(getattr(candle, "low", None)) or 0.0), 0.0)
+        for candle in window
+    ]
+    avg_range = sum(ranges) / max(len(ranges), 1)
+    if avg_range <= 0:
+        avg_range = max(abs(last_close) * 0.0001, 0.000001)
+    trend = _clamp((last_close - first_close) / (avg_range * 3.0), -1.0, 1.0)
+
+    body = 0.0
+    if last_open is not None and last_high is not None and last_low is not None:
+        body = _clamp((last_close - last_open) / max(last_high - last_low, 0.000001), -1.0, 1.0)
+    return _clamp((trend * 0.75) + (body * 0.25), -1.0, 1.0)
+
+
+def _latest_candle_payload(candle: Any | None) -> dict | None:
+    if candle is None:
+        return None
+    candle_time = getattr(candle, "time_utc", None)
+    if isinstance(candle_time, datetime):
+        candle_time = _as_utc(candle_time).isoformat()
+    return {
+        "symbol": getattr(candle, "symbol", None),
+        "timeframe": getattr(candle, "timeframe", None),
+        "time_utc": candle_time,
+        "open": _safe_float(getattr(candle, "open", None)),
+        "high": _safe_float(getattr(candle, "high", None)),
+        "low": _safe_float(getattr(candle, "low", None)),
+        "close": _safe_float(getattr(candle, "close", None)),
+        "volume": _safe_float(getattr(candle, "volume", None)),
+        "source": getattr(candle, "source", None),
+        "complete": bool(getattr(candle, "complete", True)),
+    }
+
+
+def _fetch_direction_news_context(symbol: str, *, now_utc: datetime) -> dict:
+    provider_name = (settings.NEWS_PROVIDER or "").strip().lower()
+    if provider_name != "finnhub":
+        return {
+            "provider": provider_name or None,
+            "available": False,
+            "news_count": 0,
+            "economic_event_count": 0,
+            "high_impact_event_count": 0,
+            "risk_dampener": 1.0,
+            "error": "NEWS_PROVIDER is not finnhub.",
+        }
+    if not (settings.FINNHUB_API_KEY or "").strip():
+        return {
+            "provider": "finnhub",
+            "available": False,
+            "news_count": 0,
+            "economic_event_count": 0,
+            "high_impact_event_count": 0,
+            "risk_dampener": 1.0,
+            "error": "FINNHUB_API_KEY is not configured.",
+        }
+
+    try:
+        from runner.providers.finnhub_provider import FinnhubProvider
+
+        provider = FinnhubProvider(api_key=settings.FINNHUB_API_KEY)
+        news_items = provider.get_forex_news_or_general_news(symbol)
+        calendar_payload = provider.get_economic_calendar(now_utc.date(), (now_utc + timedelta(days=1)).date())
+        calendar_items = (
+            calendar_payload.get("economicCalendar")
+            if isinstance(calendar_payload, dict) and isinstance(calendar_payload.get("economicCalendar"), list)
+            else []
+        )
+        news_count = len(news_items) if isinstance(news_items, list) else 0
+        high_impact_events = [
+            item
+            for item in calendar_items
+            if isinstance(item, dict)
+            and str(item.get("impact") or item.get("importance") or item.get("level") or "").strip().lower()
+            in {"high", "3", "3.0"}
+        ]
+        high_impact_count = len(high_impact_events)
+        return {
+            "provider": "finnhub",
+            "available": True,
+            "news_count": news_count,
+            "economic_event_count": len(calendar_items),
+            "high_impact_event_count": high_impact_count,
+            "risk_dampener": 0.88 if high_impact_count else 1.0,
+            "error": None,
+        }
+    except Exception as exc:
+        logger.warning("oracle direction Finnhub context unavailable symbol=%s error=%s", symbol, exc)
+        return {
+            "provider": "finnhub",
+            "available": False,
+            "news_count": 0,
+            "economic_event_count": 0,
+            "high_impact_event_count": 0,
+            "risk_dampener": 1.0,
+            "error": str(exc),
+        }
+
+
+def _latest_permission_for_direction(db: Session, symbol: str, *, now_utc: datetime) -> DailyPermissionSnapshot | None:
+    if UK_TZ_AVAILABLE:
+        active_date = now_utc.astimezone(UK_TZ).date()
+    else:
+        active_date = now_utc.date()
+    return (
+        _latest_daily_permission_snapshot(db, symbol, date_uk=active_date, stage="OFFICIAL")
+        or _latest_daily_permission_snapshot(db, symbol, date_uk=active_date, stage="PRELIM")
+        or _latest_daily_permission_snapshot(db, symbol)
+    )
+
+
+def _build_oracle_direction_payload(db: Session, *, symbol: str, plan: str) -> dict:
+    symbol_value = symbol.strip().upper()
+    now_value = datetime.now(timezone.utc)
+
+    provider = get_data_provider()
+    try:
+        m15_candles = provider.get_recent_candles(symbol_value, "M15", count=48)
+        h1_candles = provider.get_recent_candles(symbol_value, "H1", count=24)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to fetch OANDA/API candles: {exc}") from exc
+    if not m15_candles:
+        raise HTTPException(status_code=404, detail=f"No M15 candles available for {symbol_value}")
+
+    latest_candle = m15_candles[-1]
+    latest_candle_time = _as_utc(latest_candle.time_utc) if isinstance(getattr(latest_candle, "time_utc", None), datetime) else None
+    m15_score = _candle_direction_score(m15_candles)
+    h1_score = _candle_direction_score(h1_candles)
+
+    permission_row = _latest_permission_for_direction(db, symbol_value, now_utc=now_value)
+    permission_health = _daily_permission_health(db, symbol_value, now_utc=now_value)
+    permission_direction = str(permission_row.daily_permission if permission_row else "NO_TRADE").strip().upper()
+    permission_score = _direction_signal_value(permission_direction)
+
+    snapshot = _latest_snapshot(db, symbol_value)
+    snapshot_score = 0.0
+    snapshot_direction = None
+    snapshot_confidence = None
+    if snapshot is not None:
+        public = snapshot.public_factors_json if isinstance(snapshot.public_factors_json, dict) else {}
+        if plan == "elite":
+            snapshot_direction = snapshot.final_allowed_elite or public.get("final_allowed_elite")
+        snapshot_direction = snapshot_direction or snapshot.final_allowed_basic or public.get("final_allowed_basic")
+        snapshot_direction = snapshot_direction or public.get("opportunity_direction") or snapshot.allowed_direction
+        snapshot_score = _direction_signal_value(str(snapshot_direction or ""))
+        snapshot_confidence = _safe_float(snapshot.confidence)
+
+    targets = _latest_targets_snapshot(db, symbol_value)
+    next_buy_liquidity = _safe_float(targets.buyside_liquidity) if targets is not None else None
+    next_sell_liquidity = _safe_float(targets.sellside_liquidity) if targets is not None else None
+    magnet_state = targets.magnet_state if targets is not None and isinstance(targets.magnet_state, dict) else {}
+    current_magnet = magnet_state.get("current") if isinstance(magnet_state.get("current"), dict) else {}
+    liquidity_score = 0.0
+    magnet_side = str(current_magnet.get("side") or "").strip().upper()
+    if magnet_side == "BUY":
+        liquidity_score = 1.0
+    elif magnet_side == "SELL":
+        liquidity_score = -1.0
+
+    news_context = _fetch_direction_news_context(symbol_value, now_utc=now_value)
+
+    components = [
+        {"name": "m15_oanda_momentum", "score": round(m15_score, 4), "weight": 0.32},
+        {"name": "h1_oanda_momentum", "score": round(h1_score, 4), "weight": 0.20},
+        {"name": "permission_0801", "score": round(permission_score, 4), "weight": 0.28},
+        {"name": "latest_oracle_bias", "score": round(snapshot_score, 4), "weight": 0.10},
+        {"name": "liquidity_target", "score": round(liquidity_score, 4), "weight": 0.10},
+    ]
+    score = sum(float(item["score"]) * float(item["weight"]) for item in components)
+    if permission_direction == "NO_TRADE":
+        score *= 0.45
+    score *= float(news_context.get("risk_dampener") or 1.0)
+    score = _clamp(score, -0.95, 0.95)
+
+    buy_percent = _round_pct(((score + 1.0) / 2.0) * 100.0)
+    sell_percent = _round_pct(100.0 - buy_percent)
+    confidence_percent = _round_pct(max(buy_percent, sell_percent))
+    direction = _direction_label_from_score(score)
+    provider_labels = candle_provider_debug_labels(
+        latest_candle_source=str(getattr(latest_candle, "source", "") or _provider_source_name(provider) or "").strip() or None,
+        last_candle_time=latest_candle_time.isoformat() if latest_candle_time else None,
+        anchor_candle_source=permission_health.get("anchor_candle_source"),
+        anchor_candle_status=permission_health.get("anchor_candle_status"),
+    )
+
+    return {
+        "symbol": symbol_value,
+        "direction": direction,
+        "buy_percent": buy_percent,
+        "sell_percent": sell_percent,
+        "confidence_percent": confidence_percent,
+        "score": round(score, 4),
+        "next_buy_liquidity": next_buy_liquidity,
+        "next_sell_liquidity": next_sell_liquidity,
+        "as_of_utc": now_value.isoformat(),
+        "candle_time_utc": latest_candle_time.isoformat() if latest_candle_time else None,
+        "candle": _latest_candle_payload(latest_candle),
+        "daily_permission": permission_direction,
+        "permission_stage": str(permission_row.daily_permission_stage) if permission_row else permission_health.get("permission_stage"),
+        "permission_source": str(permission_row.permission_source) if permission_row else permission_health.get("permission_source"),
+        "permission_degraded": bool(permission_health.get("degraded")),
+        "permission_reason": permission_health.get("reason"),
+        "targets_as_of_utc": targets.as_of_utc.isoformat() if targets is not None else None,
+        "liquidity_magnet": _safe_float(targets.magnet_price) if targets is not None else None,
+        "zone_to_zone_target": _safe_float(targets.zone_to_zone_target) if targets is not None else None,
+        "snapshot_direction": snapshot_direction,
+        "snapshot_confidence": snapshot_confidence,
+        "news": news_context,
+        "components": components,
+        **provider_labels,
+    }
 
 
 def _http_detail(exc: HTTPException) -> str:
@@ -366,6 +923,14 @@ def _latest_ingest_status(db: Session, symbol: str) -> MT5IngestStatus | None:
     return db.query(MT5IngestStatus).filter(MT5IngestStatus.symbol == symbol).first()
 
 
+def _ingest_freshness_time(row: MT5IngestStatus | None, *, api_mode: bool) -> datetime | None:
+    if row is None:
+        return None
+    if api_mode and getattr(row, "updated_at", None) is not None:
+        return _as_utc(row.updated_at)
+    return _as_utc(row.last_ingested_at)
+
+
 def _latest_candle(db: Session, symbol: str, timeframe: str | None = None) -> MT5Candle | None:
     query = db.query(MT5Candle).filter(MT5Candle.symbol == symbol)
     if timeframe:
@@ -382,6 +947,27 @@ def _resolve_plan(db: Session, user: User) -> str:
 
 def _selected_symbols_for_user(db: Session, user: User, plan: str) -> list[str]:
     return get_user_enabled_symbols(db, user.id, plan)
+
+
+def _resolve_requested_symbol(
+    symbol: str | None,
+    *,
+    allowed: list[str],
+    selected: list[str],
+) -> str:
+    if symbol:
+        symbol_value = symbol.strip().upper()
+        if symbol_value not in allowed:
+            raise HTTPException(status_code=403, detail=f"Symbol '{symbol_value}' is not available on your tier")
+        if symbol_value not in selected:
+            raise HTTPException(status_code=403, detail=f"Symbol '{symbol_value}' is not enabled in your settings")
+        return symbol_value
+
+    if selected:
+        return selected[0]
+    if allowed:
+        return allowed[0]
+    raise HTTPException(status_code=404, detail="No configured symbols are available for this account")
 
 
 def _latest_quarterly_snapshot(db: Session, symbol: str) -> OracleQuarterlySnapshot | None:
@@ -441,48 +1027,18 @@ def _latest_targets_snapshot(db: Session, symbol: str) -> OracleTargetsSnapshot 
 
 
 def _london_0801_window_debug(db: Session, *, symbol: str, for_date_uk: date) -> dict:
-    target_local = datetime(for_date_uk.year, for_date_uk.month, for_date_uk.day, 8, 1, tzinfo=UK_TZ)
-    target_utc = target_local.astimezone(timezone.utc)
-    search_start_utc = target_utc - timedelta(minutes=3)
-    search_end_utc = target_utc + timedelta(minutes=5) + timedelta(minutes=1)
-
-    rows_utc = (
-        db.query(MT5Candle)
-        .filter(
-            MT5Candle.symbol == symbol,
-            MT5Candle.timeframe == "M1",
-            MT5Candle.time_utc >= search_start_utc,
-            MT5Candle.time_utc < search_end_utc,
-        )
-        .order_by(MT5Candle.time_utc.asc(), MT5Candle.created_at.asc())
-        .all()
-    )
-
-    ingest_row = db.query(MT5IngestStatus).filter(MT5IngestStatus.symbol == symbol).first()
-    broker_offset_seconds = int(ingest_row.broker_offset_seconds or 0) if ingest_row else 0
-    target_broker_utc = target_utc + timedelta(seconds=broker_offset_seconds)
-    search_start_broker_utc = search_start_utc + timedelta(seconds=broker_offset_seconds)
-    search_end_broker_utc = search_end_utc + timedelta(seconds=broker_offset_seconds)
-    rows_broker = (
-        db.query(MT5Candle)
-        .filter(
-            MT5Candle.symbol == symbol,
-            MT5Candle.timeframe == "M1",
-            MT5Candle.time_utc >= search_start_broker_utc,
-            MT5Candle.time_utc < search_end_broker_utc,
-        )
-        .order_by(MT5Candle.time_utc.asc(), MT5Candle.created_at.asc())
-        .all()
-    )
-
-    selected = None
-    selected_source = None
-    if rows_utc:
-        selected = min(rows_utc, key=lambda row: abs((_as_utc(row.time_utc) - target_utc).total_seconds()))
-        selected_source = "utc_window"
-    elif rows_broker:
-        selected = min(rows_broker, key=lambda row: abs((_as_utc(row.time_utc) - target_broker_utc).total_seconds()))
-        selected_source = "broker_window"
+    symbol_value = symbol.strip().upper()
+    window = TimeService.daily_permission_window_for_date(db, symbol=symbol_value, for_date_uk=for_date_uk)
+    target_local = window.target_london_0801_utc.astimezone(UK_TZ)
+    lookup = inspect_daily_permission_0801_lookup(db, symbol=symbol_value, window=window)
+    rows_utc = lookup["direct_candidates"]
+    rows_broker = lookup["broker_candidates"]
+    selected = lookup["selected_row"]
+    selected_source = lookup["selected_source"]
+    api_mode = api_candle_mode()
+    api_anchor = _probe_api_anchor_candle(symbol_value, target_utc=window.target_london_0801_utc) if api_mode else None
+    if api_mode and selected is None and api_anchor and api_anchor.get("ok"):
+        selected_source = "api_provider"
 
     to_item = lambda row: {  # noqa: E731
         "time_utc": _as_utc(row.time_utc).isoformat(),
@@ -495,29 +1051,75 @@ def _london_0801_window_debug(db: Session, *, symbol: str, for_date_uk: date) ->
     }
 
     payload = {
-        "symbol": symbol,
+        "symbol": symbol_value,
+        "requested_symbol": lookup.get("requested_symbol"),
+        "resolved_mt5_symbol": lookup.get("resolved_mt5_symbol"),
+        "resolved_candle_symbol": lookup.get("resolved_mt5_symbol"),
         "for_date_uk": for_date_uk.isoformat(),
         "target_0801_london": target_local.isoformat(),
-        "target_0801_utc": target_utc.isoformat(),
-        "search_start_utc": search_start_utc.isoformat(),
-        "search_end_utc": (search_end_utc - timedelta(minutes=1)).isoformat(),
-        "broker_offset_seconds": broker_offset_seconds,
-        "expected_0801_broker_time": target_broker_utc.isoformat(),
-        "search_start_broker_utc": search_start_broker_utc.isoformat(),
-        "search_end_broker_utc": (search_end_broker_utc - timedelta(minutes=1)).isoformat(),
+        "target_0801_utc": window.target_london_0801_utc.isoformat(),
+        "search_start_utc": window.search_start_utc.isoformat(),
+        "search_end_utc": (window.search_end_utc - timedelta(minutes=1)).isoformat(),
+        "broker_offset_seconds": window.broker_offset_seconds,
+        "expected_0801_broker_time": window.expected_0801_broker_utc.isoformat(),
+        "search_start_broker_utc": window.search_start_broker_utc.isoformat(),
+        "search_end_broker_utc": (window.search_end_broker_utc - timedelta(minutes=1)).isoformat(),
+        "nearest_available_candle_time": _as_utc(lookup["nearest_row"].time_utc).isoformat() if lookup.get("nearest_row") else None,
+        "nearest_available_candle_time_london": _as_utc(lookup["nearest_row"].time_utc).astimezone(UK_TZ).isoformat()
+        if lookup.get("nearest_row")
+        else None,
+        "nearest_available_candle_source": (
+            api_anchor.get("source")
+            if api_mode and isinstance(api_anchor, dict) and api_anchor.get("source")
+            else lookup.get("nearest_source")
+        ),
+        "nearest_available_candle_delta_seconds": (
+            api_anchor.get("nearest_delta_seconds")
+            if api_mode and isinstance(api_anchor, dict) and api_anchor.get("nearest_delta_seconds") is not None
+            else lookup.get("nearest_delta_seconds")
+        ),
+        "selection_tolerance_seconds": lookup.get("selection_tolerance_seconds"),
+        "selected_time_delta_seconds": lookup.get("selected_delta_seconds"),
         "utc_window_candles": [to_item(row) for row in rows_utc],
         "broker_window_candles": [to_item(row) for row in rows_broker],
         "selected_source": selected_source,
-        "selected_0801": to_item(selected) if selected is not None else None,
+        "selected_0801": (
+            to_item(selected)
+            if selected is not None
+            else (
+                {
+                    "time_utc": api_anchor.get("time_utc_iso"),
+                    "time_london": _parse_iso_utc(api_anchor.get("time_utc_iso")).astimezone(UK_TZ).isoformat()
+                    if isinstance(api_anchor, dict) and api_anchor.get("time_utc_iso") and _parse_iso_utc(api_anchor.get("time_utc_iso"))
+                    else None,
+                    "open": None,
+                    "high": None,
+                    "low": None,
+                    "close": None,
+                    "volume": None,
+                }
+                if api_mode and isinstance(api_anchor, dict) and api_anchor.get("ok")
+                else None
+            )
+        ),
+        "api_mode": api_mode,
+        **candle_provider_debug_labels(
+            latest_candle_source=None,
+            last_candle_time=None,
+            anchor_candle_source=api_anchor.get("source") if isinstance(api_anchor, dict) else lookup.get("nearest_source"),
+            anchor_candle_status=api_anchor.get("status") if isinstance(api_anchor, dict) else ("found" if selected else "missing"),
+        ),
     }
     logger.info(
-        "oracle 0801 debug symbol=%s for_date_uk=%s utc_candidates=%s broker_candidates=%s selected_source=%s selected_time=%s",
-        symbol,
+        "oracle 0801 debug symbol=%s resolved_symbol=%s for_date_uk=%s utc_candidates=%s broker_candidates=%s selected_source=%s selected_time=%s nearest=%s",
+        symbol_value,
+        lookup.get("resolved_mt5_symbol"),
         for_date_uk.isoformat(),
         len(rows_utc),
         len(rows_broker),
         selected_source,
         payload["selected_0801"]["time_utc"] if payload["selected_0801"] else None,
+        payload.get("nearest_available_candle_time"),
     )
     return payload
 
@@ -771,18 +1373,14 @@ def _tier_shape(data: dict, plan: str) -> dict:
 
 @router.get("/quarterly/snapshot")
 def get_quarterly_snapshot(
-    symbol: str = "XAUUSD",
+    symbol: str | None = None,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     plan = _resolve_plan(db, user)
-    symbol_value = symbol.strip().upper()
     allowed = allowed_symbols_for_plan(plan)
     selected = _selected_symbols_for_user(db, user, plan)
-    if symbol_value not in allowed:
-        raise HTTPException(status_code=403, detail=f"Symbol '{symbol_value}' is not available on your tier")
-    if symbol_value not in selected:
-        raise HTTPException(status_code=403, detail=f"Symbol '{symbol_value}' is not enabled in your settings")
+    symbol_value = _resolve_requested_symbol(symbol, allowed=allowed, selected=selected)
 
     row = _latest_quarterly_snapshot(db, symbol_value)
     if not row:
@@ -807,18 +1405,14 @@ def get_quarterly_snapshot(
 
 @router.get("/permission/today")
 def get_permission_today(
-    symbol: str = "XAUUSD",
+    symbol: str | None = None,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     plan = _resolve_plan(db, user)
-    symbol_value = symbol.strip().upper()
     allowed = allowed_symbols_for_plan(plan)
     selected = _selected_symbols_for_user(db, user, plan)
-    if symbol_value not in allowed:
-        raise HTTPException(status_code=403, detail=f"Symbol '{symbol_value}' is not available on your tier")
-    if symbol_value not in selected:
-        raise HTTPException(status_code=403, detail=f"Symbol '{symbol_value}' is not enabled in your settings")
+    symbol_value = _resolve_requested_symbol(symbol, allowed=allowed, selected=selected)
 
     now_uk = datetime.now(UK_TZ)
     row = _today_permission_decision(db, symbol_value, now_uk) or _latest_permission_decision(db, symbol_value)
@@ -849,18 +1443,14 @@ def get_permission_today(
 
 @router.get("/latest")
 def get_latest_oracle_snapshot(
-    symbol: str = "XAUUSD",
+    symbol: str | None = None,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     plan = _resolve_plan(db, user)
-    symbol_value = symbol.strip().upper()
     allowed = allowed_symbols_for_plan(plan)
     selected = _selected_symbols_for_user(db, user, plan)
-    if symbol_value not in allowed:
-        raise HTTPException(status_code=403, detail=f"Symbol '{symbol_value}' is not available on your tier")
-    if symbol_value not in selected:
-        raise HTTPException(status_code=403, detail=f"Symbol '{symbol_value}' is not enabled in your settings")
+    symbol_value = _resolve_requested_symbol(symbol, allowed=allowed, selected=selected)
 
     snapshot = _latest_snapshot(db, symbol_value)
     if snapshot:
@@ -895,19 +1485,15 @@ def get_latest_oracle_snapshot(
 
 @router.get("/session-context")
 def get_oracle_session_context(
-    symbol: str = "GBPJPY",
+    symbol: str | None = None,
     as_of_utc: datetime | None = None,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     plan = _resolve_plan(db, user)
-    symbol_value = symbol.strip().upper()
     allowed = allowed_symbols_for_plan(plan)
     selected = _selected_symbols_for_user(db, user, plan)
-    if symbol_value not in allowed:
-        raise HTTPException(status_code=403, detail=f"Symbol '{symbol_value}' is not available on your tier")
-    if symbol_value not in selected:
-        raise HTTPException(status_code=403, detail=f"Symbol '{symbol_value}' is not enabled in your settings")
+    symbol_value = _resolve_requested_symbol(symbol, allowed=allowed, selected=selected)
 
     try:
         return get_symbol_session_context(db, symbol=symbol_value, as_of_utc=as_of_utc)
@@ -917,19 +1503,20 @@ def get_oracle_session_context(
 
 @router.get("/snapshot/latest")
 def get_latest_oracle_snapshot_contract(
-    symbol: str = "XAUUSD",
+    symbol: str | None = None,
     stale_after_minutes: int = 20,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     payload = get_latest_oracle_snapshot(symbol=symbol, user=user, db=db)
-    symbol_value = symbol.strip().upper()
+    symbol_value = payload["symbol"]
     now_utc = datetime.now(timezone.utc)
 
     ingest_row = _latest_ingest_status(db, symbol_value)
     compute_row = _latest_snapshot(db, symbol_value)
     latest_m15 = _latest_candle(db, symbol=symbol_value, timeframe="M15")
-    last_ingest = _as_utc(ingest_row.last_ingested_at) if ingest_row else None
+    api_mode = api_candle_mode()
+    last_ingest = _ingest_freshness_time(ingest_row, api_mode=api_mode)
     last_compute = _snapshot_compute_time(compute_row)
     last_candle_close = _as_utc(latest_m15.time_utc) if latest_m15 else None
     compute_age_seconds = max(int((now_utc - last_compute).total_seconds()), 0) if last_compute else None
@@ -938,18 +1525,34 @@ def get_latest_oracle_snapshot_contract(
     stale_threshold_seconds = 300
     candle_age_seconds = max(int((now_utc - last_candle_close).total_seconds()), 0) if last_candle_close else None
     stale_reasons: list[str] = []
+    latest_api_probe = _probe_latest_api_candle(symbol_value, "M15") if api_mode else None
+    if api_mode and latest_api_probe and latest_api_probe.get("ok"):
+        probed_time = latest_api_probe.get("time_utc")
+        if isinstance(probed_time, datetime) and (last_candle_close is None or probed_time > last_candle_close):
+            last_candle_close = probed_time
+            candle_age_seconds = max(int((now_utc - last_candle_close).total_seconds()), 0)
 
     def _add_reason(reason: str) -> None:
         if reason not in stale_reasons:
             stale_reasons.append(reason)
 
-    if last_ingest is None:
+    if not api_mode and last_ingest is None:
         _add_reason("mt5_down")
-    elif ingest_age_seconds is not None and ingest_age_seconds > stale_threshold_seconds:
+    elif not api_mode and ingest_age_seconds is not None and ingest_age_seconds > stale_threshold_seconds:
         _add_reason("ingest_lag")
     if last_candle_close is None:
         _add_reason("m15_missing")
     permission_health = _daily_permission_health(db, symbol_value, now_utc=now_utc)
+    provider_labels = candle_provider_debug_labels(
+        latest_candle_source=(
+            latest_api_probe.get("source")
+            if isinstance(latest_api_probe, dict) and latest_api_probe.get("source")
+            else permission_health.get("latest_candle_source")
+        ),
+        last_candle_time=last_candle_close.isoformat() if last_candle_close else permission_health.get("last_candle_time"),
+        anchor_candle_source=permission_health.get("anchor_candle_source"),
+        anchor_candle_status=permission_health.get("anchor_candle_status"),
+    )
     is_stale = len(stale_reasons) > 0
     if is_stale:
         logger.warning(
@@ -999,6 +1602,9 @@ def get_latest_oracle_snapshot_contract(
             "daily_permission_degraded": bool(permission_health.get("degraded")),
             "daily_permission_degraded_reason": permission_health.get("reason"),
             "runner_last_error": permission_health.get("runner_last_error"),
+            "api_mode": api_mode,
+            "api_candle_error": latest_api_probe.get("error") if isinstance(latest_api_probe, dict) else None,
+            **provider_labels,
             "daily_permission_backfill_attempted": bool(permission_health.get("backfill_attempted")),
             "daily_permission_backfill_result": permission_health.get("backfill_result"),
             "permission_stage": out.get("permission_stage") or permission_health.get("permission_stage"),
@@ -1009,6 +1615,34 @@ def get_latest_oracle_snapshot_contract(
         }
     )
     return out
+
+
+@router.get("/direction/{symbol}")
+def get_oracle_direction(
+    symbol: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    logger.info(
+        "oracle_direction_request_hit symbol=%s user_id=%s data_provider=%s market_data_provider=%s disable_mt5=%s api_candle_mode=%s",
+        symbol,
+        getattr(user, "id", None),
+        settings.DATA_PROVIDER,
+        settings.MARKET_DATA_PROVIDER,
+        settings.DISABLE_MT5,
+        api_candle_mode(),
+    )
+    try:
+        plan = _resolve_plan(db, user)
+        allowed = allowed_symbols_for_plan(plan)
+        selected = _selected_symbols_for_user(db, user, plan)
+        symbol_value = _resolve_requested_symbol(symbol, allowed=allowed, selected=selected)
+        return _build_oracle_direction_payload(db, symbol=symbol_value, plan=plan)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("oracle_direction_request_failed symbol=%s", symbol)
+        raise HTTPException(status_code=500, detail=f"Oracle Direction failed: {exc}") from exc
 
 
 @router.get("/status")
@@ -1034,12 +1668,13 @@ def get_oracle_status(
     items: list[dict] = []
     timeframe_seconds = 15 * 60
     stale_threshold_seconds = 300
+    api_mode = api_candle_mode()
     for symbol_value in symbols:
         ingest_row = _latest_ingest_status(db, symbol_value)
         compute_row = _latest_snapshot(db, symbol_value)
         latest_m15 = _latest_candle(db, symbol=symbol_value, timeframe="M15")
 
-        last_ingest = _as_utc(ingest_row.last_ingested_at) if ingest_row else None
+        last_ingest = _ingest_freshness_time(ingest_row, api_mode=api_mode)
         last_compute = _snapshot_compute_time(compute_row)
         last_snapshot_as_of = _as_utc(compute_row.as_of_utc) if compute_row else None
         last_candle_close = _as_utc(latest_m15.time_utc) if latest_m15 else None
@@ -1048,18 +1683,35 @@ def get_oracle_status(
         ingest_age_seconds = max(int((now_utc - last_ingest).total_seconds()), 0) if last_ingest else None
         candle_age_seconds = max(int((now_utc - last_candle_close).total_seconds()), 0) if last_candle_close else None
         stale_reasons: list[str] = []
+        latest_api_probe = _probe_latest_api_candle(symbol_value, "M15") if api_mode else None
+        if api_mode and latest_api_probe and latest_api_probe.get("ok"):
+            probed_time = latest_api_probe.get("time_utc")
+            if isinstance(probed_time, datetime) and (last_candle_close is None or probed_time > last_candle_close):
+                last_candle_close = probed_time
+                candle_age_seconds = max(int((now_utc - last_candle_close).total_seconds()), 0)
+
         def _add_reason(reason: str) -> None:
             if reason not in stale_reasons:
                 stale_reasons.append(reason)
 
-        if last_ingest is None:
+        if not api_mode and last_ingest is None:
             _add_reason("mt5_down")
-        elif ingest_age_seconds is not None and ingest_age_seconds > stale_threshold_seconds:
+        elif not api_mode and ingest_age_seconds is not None and ingest_age_seconds > stale_threshold_seconds:
             _add_reason("ingest_lag")
         if last_candle_close is None:
             _add_reason("m15_missing")
 
         permission_health = _daily_permission_health(db, symbol_value, now_utc=now_utc)
+        provider_labels = candle_provider_debug_labels(
+            latest_candle_source=(
+                latest_api_probe.get("source")
+                if isinstance(latest_api_probe, dict) and latest_api_probe.get("source")
+                else permission_health.get("latest_candle_source")
+            ),
+            last_candle_time=last_candle_close.isoformat() if last_candle_close else permission_health.get("last_candle_time"),
+            anchor_candle_source=permission_health.get("anchor_candle_source"),
+            anchor_candle_status=permission_health.get("anchor_candle_status"),
+        )
         is_stale = len(stale_reasons) > 0
         if is_stale:
             logger.warning(
@@ -1103,6 +1755,9 @@ def get_oracle_status(
                 "daily_permission_degraded": bool(permission_health.get("degraded")),
                 "daily_permission_degraded_reason": permission_health.get("reason"),
                 "runner_last_error": permission_health.get("runner_last_error"),
+                "api_mode": api_mode,
+                "api_candle_error": latest_api_probe.get("error") if isinstance(latest_api_probe, dict) else None,
+                **provider_labels,
                 "daily_permission_backfill_attempted": bool(permission_health.get("backfill_attempted")),
                 "daily_permission_backfill_result": permission_health.get("backfill_result"),
                 "permission_stage": permission_health.get("permission_stage"),
@@ -1148,7 +1803,7 @@ def run_basic_oracle(
     _admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    resolved_symbol = symbol or settings.ORACLE_SYMBOL
+    resolved_symbol = (symbol or default_configured_symbol()).strip().upper()
     resolved_timeframe = timeframe or settings.ORACLE_TIMEFRAME
     run_id = uuid4()
 

@@ -6,3 +6,34 @@ __pycache__/
 trading-ui/.env.local
 trading-ui/node_modules/
 trading-ui/.next/
+runtime/
+*.json
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Local databases
+local.db
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+.next/
+
+# macOS
+.DS_Store
+
+# VS Code
+.vscode/
+
+# Logs
+*.log

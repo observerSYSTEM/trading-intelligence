@@ -1,3 +1,5 @@
+from typing import ClassVar
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import field_validator
 from urllib.parse import urlsplit
@@ -7,6 +9,12 @@ from app.core.db_url import normalize_database_url
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    LOCAL_DEV_CORS_ORIGINS: ClassVar[tuple[str, ...]] = (
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+    )
 
     DATABASE_URL: str = "postgresql+psycopg2://postgres:postgres@127.0.0.1:5432/tradeos"
     APP_ENV: str = "development"
@@ -23,6 +31,21 @@ class Settings(BaseSettings):
     REDIS_URL: str | None = None
 
     MARKET_DATA_PROVIDER: str = "mt5"
+    DATA_PROVIDER: str = ""
+    CANDLE_PROVIDER: str = "oanda"
+    CANDLE_FALLBACK_PROVIDER: str = "twelvedata"
+    NEWS_PROVIDER: str = "finnhub"
+    FINNHUB_API_KEY: str = ""
+    OANDA_API_KEY: str = ""
+    OANDA_ACCOUNT_ID: str = ""
+    OANDA_ENV: str = "practice"
+    OANDA_TIMEOUT_SECONDS: int = 10
+    OANDA_SYMBOL_MAP_JSON: str = ""
+    TWELVE_DATA_API_KEY: str = ""
+    TWELVE_DATA_BASE_URL: str = "https://api.twelvedata.com"
+    TWELVE_DATA_TIMEOUT_SECONDS: int = 10
+    TWELVE_DATA_SYMBOL_MAP_JSON: str = ""
+    DISABLE_MT5: bool = False
     MARKET_INGEST_HEARTBEAT_ENABLED: bool = False
     ORACLE_SCHEDULER_IN_API: bool = False
     ORACLE_SYMBOL: str = "XAUUSD"
@@ -147,13 +170,13 @@ class Settings(BaseSettings):
 
     @property
     def cors_origins(self) -> list[str]:
-        origins = [self.FRONTEND_URL.strip()]
-        raw = ",".join([self.CORS_ALLOW_ORIGINS, self.CORS_ORIGINS])
-        if raw:
-            for value in raw.split(","):
-                item = value.strip()
-                if item:
-                    origins.append(item)
+        origins = list(self.LOCAL_DEV_CORS_ORIGINS)
+        raw = ",".join([self.FRONTEND_URL, self.CORS_ALLOW_ORIGINS, self.CORS_ORIGINS])
+        for value in raw.split(","):
+            item = value.strip()
+            if item:
+                origins.append(item)
+
         unique: list[str] = []
         for item in origins:
             if not item:
@@ -178,9 +201,10 @@ class Settings(BaseSettings):
         path = parsed.path or ""
         if path == "/":
             path = ""
+        paired_host = "127.0.0.1" if host == "localhost" else "localhost"
         candidates = [
-            f"{scheme}://127.0.0.1{port}{path}",
-            f"{scheme}://localhost{port}{path}",
+            clean,
+            f"{scheme}://{paired_host}{port}{path}",
         ]
         return list(dict.fromkeys(candidates))
 

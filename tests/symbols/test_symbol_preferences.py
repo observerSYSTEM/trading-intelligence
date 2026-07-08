@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import sys
+import types
 import unittest
 import uuid
 from contextlib import contextmanager
+from unittest.mock import patch
 
 from fastapi import HTTPException
 from pydantic import ValidationError
@@ -11,9 +14,17 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+jwt_stub = types.ModuleType("jwt")
+jwt_stub.encode = lambda *args, **kwargs: "token"
+jwt_stub.decode = lambda *args, **kwargs: {"sub": "stub@example.com"}
+sys.modules.setdefault("jwt", jwt_stub)
+
 from app.api.symbols import SymbolPreferencesIn, put_symbols_preferences
 from app.db.base import Base
-from app.db.models import Subscription, User, UserSymbolPreference
+from app.db.models import Subscription, User, UserSignalPref, UserSymbolPreference
+from app.services.symbol_preferences import get_user_enabled_symbols
+
+FULL_SYMBOLS_ENV = {"ORACLE_ENABLED_SYMBOLS": "XAUUSD,GBPUSD,EURUSD,GBPJPY,BTCUSD"}
 
 
 @contextmanager
@@ -49,7 +60,26 @@ def _mk_user(db: Session, email: str, *, plan: str) -> User:
     return user
 
 
+@patch.dict("os.environ", FULL_SYMBOLS_ENV, clear=False)
 class SymbolPreferenceTests(unittest.TestCase):
+    def test_elite_user_defaults_include_gbpjpy_without_saved_preferences(self):
+        with test_db() as db:
+            user = _mk_user(db, "elite-default@test.com", plan="elite")
+
+            selected = get_user_enabled_symbols(db, user.id, "elite")
+
+            self.assertEqual(selected, ["XAUUSD", "GBPJPY"])
+
+    def test_saved_preferences_still_override_elite_default_symbols(self):
+        with test_db() as db:
+            user = _mk_user(db, "elite-saved@test.com", plan="elite")
+            db.add(UserSignalPref(user_id=user.id, symbols_json=["XAUUSD"]))
+            db.commit()
+
+            selected = get_user_enabled_symbols(db, user.id, "elite")
+
+            self.assertEqual(selected, ["XAUUSD"])
+
     def test_basic_user_cannot_enable_eurusd(self):
         with test_db() as db:
             user = _mk_user(db, "basic@test.com", plan="basic")

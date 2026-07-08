@@ -1,0 +1,188 @@
+databases:
+  - name: trading-intelligence-postgres
+    databaseName: trading_intelligence
+    user: trading_intelligence
+    plan: starter
+
+services:
+  - type: web
+    name: trading-intelligence-api
+    runtime: python
+    plan: starter
+    buildCommand: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+    preDeployCommand: alembic upgrade head
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: APP_URL
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
+      - key: API_VERSION_PREFIX
+        value: /api/v1
+      - key: DATABASE_URL
+        fromDatabase:
+          name: trading-intelligence-postgres
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_EXPIRE_MINUTES
+        value: 30
+      - key: JWT_REFRESH_EXPIRE_DAYS
+        value: 14
+      - key: ALLOW_PUBLIC_REGISTRATION
+        value: false
+      - key: CORS_ALLOW_CREDENTIALS
+        value: false
+      - key: CORS_ALLOW_ORIGINS
+        sync: false
+      - key: TRUSTED_HOSTS
+        sync: false
+      - key: RATE_LIMIT_ENABLED
+        value: true
+      - key: DATA_PROVIDER
+        value: api
+      - key: MARKET_DATA_PROVIDER
+        value: api
+      - key: CANDLE_PROVIDER
+        value: oanda
+      - key: CANDLE_FALLBACK_PROVIDER
+        value: twelvedata
+      - key: NEWS_PROVIDER
+        value: finnhub
+      - key: DISABLE_MT5
+        value: true
+      - key: OANDA_API_KEY
+        sync: false
+      - key: OANDA_ACCOUNT_ID
+        sync: false
+      - key: OANDA_ENV
+        value: practice
+      - key: TWELVE_DATA_API_KEY
+        sync: false
+      - key: FINNHUB_API_KEY
+        sync: false
+      - key: ORACLE_ENABLED_SYMBOLS
+        value: XAUUSD,GBPJPY,GBPUSD,EURUSD,BTCUSD
+      - key: ORACLE_SCHEDULER_IN_API
+        value: false
+      - key: MARKET_INGEST_HEARTBEAT_ENABLED
+        value: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_PRICE_ID_BASIC
+        sync: false
+      - key: STRIPE_PRICE_ID_PRO
+        sync: false
+      - key: STRIPE_PRICE_ID_ELITE
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: RUNNER_API_KEY
+        generateValue: true
+      - key: SIGNAL_API_TOKEN
+        generateValue: true
+      - key: AUTOTRADE_ENABLED
+        value: false
+
+  - type: worker
+    name: trading-intelligence-worker
+    runtime: python
+    plan: starter
+    buildCommand: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+    startCommand: python -m app.worker.oracle_worker
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: APP_URL
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
+      - key: API_VERSION_PREFIX
+        value: /api/v1
+      - key: DATABASE_URL
+        fromDatabase:
+          name: trading-intelligence-postgres
+          property: connectionString
+      - key: JWT_SECRET
+        fromService:
+          type: web
+          name: trading-intelligence-api
+          envVarKey: JWT_SECRET
+      - key: RATE_LIMIT_ENABLED
+        value: true
+      - key: DATA_PROVIDER
+        value: api
+      - key: MARKET_DATA_PROVIDER
+        value: api
+      - key: CANDLE_PROVIDER
+        value: oanda
+      - key: CANDLE_FALLBACK_PROVIDER
+        value: twelvedata
+      - key: NEWS_PROVIDER
+        value: finnhub
+      - key: DISABLE_MT5
+        value: true
+      - key: OANDA_API_KEY
+        sync: false
+      - key: OANDA_ACCOUNT_ID
+        sync: false
+      - key: OANDA_ENV
+        value: practice
+      - key: TWELVE_DATA_API_KEY
+        sync: false
+      - key: FINNHUB_API_KEY
+        sync: false
+      - key: ORACLE_ENABLED_SYMBOLS
+        value: XAUUSD,GBPJPY,GBPUSD,EURUSD,BTCUSD
+      - key: ORACLE_SCHEDULER_IN_API
+        value: false
+      - key: MARKET_INGEST_HEARTBEAT_ENABLED
+        value: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_PRICE_ID_BASIC
+        sync: false
+      - key: STRIPE_PRICE_ID_PRO
+        sync: false
+      - key: STRIPE_PRICE_ID_ELITE
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: RUNNER_API_KEY
+        fromService:
+          type: web
+          name: trading-intelligence-api
+          envVarKey: RUNNER_API_KEY
+      - key: SIGNAL_API_TOKEN
+        fromService:
+          type: web
+          name: trading-intelligence-api
+          envVarKey: SIGNAL_API_TOKEN
+      - key: AUTOTRADE_ENABLED
+        value: false
+
+  - type: web
+    name: trading-intelligence-ui
+    runtime: node
+    plan: starter
+    rootDir: trading-ui
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start -- -H 0.0.0.0 -p $PORT
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NEXT_PUBLIC_API_BASE_URL
+        sync: false
+      - key: NEXT_PUBLIC_API_BASE
+        sync: false

@@ -17,7 +17,11 @@ from app.db.models import GoldRegimeDaily, LiquiditySignal, MT5Candle, OracleTar
 from app.db.session import get_db
 from app.schemas.signal import SignalCreate, SignalCreateResult, SignalListOut, SignalOut
 from app.services.signal_service import create_signal, extract_signal_fields, get_latest_signals, get_signal_by_id, get_signals
-from app.services.targets_refresh import recompute_targets_snapshot
+from app.services.targets_refresh import (
+    TARGETS_MARKET_FEED_DELAY_THRESHOLD_SECONDS,
+    latest_market_feed_freshness,
+    recompute_targets_snapshot,
+)
 from app.services.symbol_preferences import get_user_enabled_symbols
 
 router = APIRouter(prefix="/signals", tags=["signals"])
@@ -169,20 +173,27 @@ def _ensure_fresh_targets(
         return latest
 
     try:
+        refresh_as_of = datetime.now(timezone.utc)
+        try:
+            freshness = latest_market_feed_freshness(db, symbol=symbol)
+            refresh_as_of = freshness.get("latest_market_feed_at") or refresh_as_of
+        except Exception:
+            logger.exception("targets freshness guard market feed lookup failed symbol=%s timeframe=H1", symbol)
         refreshed = recompute_targets_snapshot(
             db,
             symbol=symbol,
             tier=tier,
             price_bid=latest_h1_close,
             price_ask=latest_h1_close,
-            as_of_utc=datetime.now(timezone.utc),
+            as_of_utc=refresh_as_of,
             reason="api_freshness_guard",
         )
         db.commit()
         logger.info(
-            "targets freshness guard recompute symbol=%s timeframe=H1 latest_candle_time=%s computed_at=%s snapshot_id=%s",
+            "targets freshness guard recompute symbol=%s timeframe=H1 latest_candle_time=%s refresh_as_of=%s computed_at=%s snapshot_id=%s",
             symbol,
             latest_h1_time.isoformat(),
+            _as_utc(refresh_as_of).isoformat(),
             _as_utc(refreshed.as_of_utc).isoformat(),
             str(refreshed.id),
         )
@@ -386,6 +397,44 @@ def latest_targets(
         raise HTTPException(status_code=404, detail=f"No targets snapshot available yet for {symbol_value}")
 
     magnet_state = row.magnet_state if isinstance(row.magnet_state, dict) else {}
+    now_utc = datetime.now(timezone.utc)
+    try:
+        market_feed = latest_market_feed_freshness(db, symbol=symbol_value, now_utc=now_utc)
+    except Exception:
+        logger.exception("targets latest market freshness failed symbol=%s tier=%s", symbol_value, requested_tier)
+        fallback_as_of = _as_utc(row.as_of_utc)
+        fallback_age_seconds = max(int((now_utc - fallback_as_of).total_seconds()), 0)
+        market_feed = {
+            "last_ingest_at": None,
+            "latest_candle_time": None,
+            "latest_candle_timeframe": None,
+            "latest_market_feed_at": fallback_as_of,
+            "latest_market_feed_source": "targets_snapshot_fallback",
+            "market_feed_age_seconds": fallback_age_seconds,
+            "market_feed_delayed": fallback_age_seconds > TARGETS_MARKET_FEED_DELAY_THRESHOLD_SECONDS,
+            "market_feed_delay_reason": "freshness_calc_failed",
+            "market_feed_delay_threshold_seconds": TARGETS_MARKET_FEED_DELAY_THRESHOLD_SECONDS,
+        }
+
+    freshness_log = (
+        logger.warning if bool(market_feed.get("market_feed_delayed")) else logger.debug
+    )
+    freshness_log(
+        "targets latest freshness symbol=%s tier=%s snapshot_as_of=%s latest_market_feed_at=%s latest_ingest_at=%s "
+        "latest_candle_time=%s latest_candle_timeframe=%s source=%s age_seconds=%s delayed=%s threshold_seconds=%s",
+        row.symbol,
+        row.tier,
+        _as_utc(row.as_of_utc).isoformat(),
+        market_feed.get("latest_market_feed_at").isoformat() if market_feed.get("latest_market_feed_at") else None,
+        market_feed.get("last_ingest_at").isoformat() if market_feed.get("last_ingest_at") else None,
+        market_feed.get("latest_candle_time").isoformat() if market_feed.get("latest_candle_time") else None,
+        market_feed.get("latest_candle_timeframe"),
+        market_feed.get("latest_market_feed_source"),
+        market_feed.get("market_feed_age_seconds"),
+        market_feed.get("market_feed_delayed"),
+        market_feed.get("market_feed_delay_threshold_seconds"),
+    )
+
     return {
         "symbol": row.symbol,
         "tier": row.tier,
@@ -398,6 +447,19 @@ def latest_targets(
         "sellside_liquidity": row.sellside_liquidity,
         "buyside_liquidity": row.buyside_liquidity,
         "magnet_state": magnet_state,
+        "latest_ingest_at_utc": market_feed.get("last_ingest_at").isoformat() if market_feed.get("last_ingest_at") else None,
+        "latest_candle_time_utc": (
+            market_feed.get("latest_candle_time").isoformat() if market_feed.get("latest_candle_time") else None
+        ),
+        "latest_candle_timeframe": market_feed.get("latest_candle_timeframe"),
+        "latest_market_feed_at_utc": (
+            market_feed.get("latest_market_feed_at").isoformat() if market_feed.get("latest_market_feed_at") else None
+        ),
+        "latest_market_feed_source": market_feed.get("latest_market_feed_source"),
+        "market_feed_age_seconds": market_feed.get("market_feed_age_seconds"),
+        "market_feed_delayed": market_feed.get("market_feed_delayed"),
+        "market_feed_delay_reason": market_feed.get("market_feed_delay_reason"),
+        "market_feed_delay_threshold_seconds": market_feed.get("market_feed_delay_threshold_seconds"),
     }
 
 

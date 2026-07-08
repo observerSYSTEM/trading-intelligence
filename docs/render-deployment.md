@@ -1,5 +1,10 @@
 # Render Deployment (Production)
 
+For the current public SaaS deployment plan, use
+[production-deployment.md](./production-deployment.md) and the root
+[render.yaml](../render.yaml). This file is retained as a compact command
+reference for the Render services.
+
 ## Services
 
 ### 1) Web Service

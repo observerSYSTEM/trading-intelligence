@@ -12,6 +12,7 @@ from app.api.deps import require_runner_auth
 from app.core.rate_limit import RateLimitRule, rate_limit
 from app.db.models import GoldRegimeDaily, MT5Candle, MT5IngestStatus
 from app.db.session import get_db
+from app.services.data_provider import api_candle_mode
 from app.services.oracle_basic import oracle_from_candle
 from app.services.targets_refresh import maybe_refresh_targets_on_magnet_hit, recompute_targets_snapshot
 
@@ -173,6 +174,16 @@ def ingest_mt5_candle(
             status_row.broker_offset_detected_at = now_value
 
     db.commit()
+    source_value = str(payload.source or "").strip().lower()
+    if api_candle_mode() or source_value in {"oanda", "twelvedata", "api_candle_runner_loop"}:
+        logger.info(
+            "api_candle_ingest_write_ok symbol=%s timeframe=%s candle_time_utc=%s source=%s created=%s",
+            symbol,
+            timeframe,
+            as_of_utc.isoformat(),
+            payload.source,
+            candle_created,
+        )
 
     if timeframe == "H1":
         try:

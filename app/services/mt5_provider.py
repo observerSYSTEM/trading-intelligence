@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from importlib import import_module
 from typing import Any
 
+from app.core.symbols import configured_symbol_map_from_env, resolve_mt5_broker_symbol
 from app.services.data_provider import Candle
+
+logger = logging.getLogger(__name__)
 
 
 class MT5Provider:
@@ -16,12 +20,15 @@ class MT5Provider:
         login: int | None = None,
         password: str | None = None,
         server: str | None = None,
+        symbol_map: dict[str, str] | None = None,
     ) -> None:
         self.terminal_path = terminal_path
         self.login_id = login
         self.password = password
         self.server = server
+        self.symbol_map = dict(symbol_map if symbol_map is not None else configured_symbol_map_from_env())
         self.mt5 = self._load_mt5_module()
+        self._broker_symbols: dict[str, str] = {}
 
     def _load_mt5_module(self) -> Any:
         try:
@@ -54,7 +61,7 @@ class MT5Provider:
 
     def _initialize(self) -> None:
         if self.terminal_path:
-            ok = self.mt5.initialize(path=self.terminal_path)
+            ok = self.mt5.initialize()
         else:
             ok = self.mt5.initialize()
 
@@ -70,31 +77,45 @@ class MT5Provider:
             if not ok:
                 raise RuntimeError(f"MT5 login failed: {self.mt5.last_error()}")
 
+    def _resolve_broker_symbol(self, requested_symbol: str) -> str:
+        return resolve_mt5_broker_symbol(
+            self.mt5,
+            requested_symbol,
+            symbol_map=self.symbol_map,
+            cache=self._broker_symbols,
+            on_resolve=lambda payload: logger.info(
+                "mt5 provider symbol resolved requested=%s broker_symbol=%s source=%s",
+                payload.get("requested_symbol"),
+                payload.get("resolved_symbol"),
+                payload.get("resolution_source"),
+            ),
+        )
+
     def get_latest_closed_candle(self, symbol: str, timeframe: str) -> Candle:
         tf_const = self._resolve_timeframe(timeframe)
 
         try:
             self._initialize()
-
-            if not self.mt5.symbol_select(symbol, True):
-                raise RuntimeError(f"MT5 symbol_select failed for '{symbol}': {self.mt5.last_error()}")
+            requested_symbol = (symbol or "").strip().upper()
+            resolved_symbol = self._resolve_broker_symbol(requested_symbol)
 
             # start_pos=1 returns the latest fully closed bar (0 is the still-forming bar)
-            rates = self.mt5.copy_rates_from_pos(symbol, tf_const, 1, 1)
+            rates = self.mt5.copy_rates_from_pos(resolved_symbol, tf_const, 1, 1)
             if rates is None or len(rates) == 0:
-                raise RuntimeError(f"No MT5 candle returned for {symbol} {timeframe}")
+                raise RuntimeError(f"No MT5 candle returned for {requested_symbol}/{resolved_symbol} {timeframe}")
 
             row = rates[0]
             candle_time = datetime.fromtimestamp(int(row["time"]), tz=timezone.utc)
 
             return Candle(
-                symbol=symbol,
+                symbol=requested_symbol,
                 timeframe=timeframe.upper(),
                 time_utc=candle_time,
                 open=float(row["open"]),
                 high=float(row["high"]),
                 low=float(row["low"]),
                 close=float(row["close"]),
+                broker_symbol=resolved_symbol,
                 volume=float(row["tick_volume"]),
             )
         finally:
@@ -116,26 +137,28 @@ class MT5Provider:
 
         try:
             self._initialize()
+            requested_symbol = (symbol or "").strip().upper()
+            resolved_symbol = self._resolve_broker_symbol(requested_symbol)
 
-            if not self.mt5.symbol_select(symbol, True):
-                raise RuntimeError(f"MT5 symbol_select failed for '{symbol}': {self.mt5.last_error()}")
-
-            rates = self.mt5.copy_rates_range(symbol, tf_const, start, end)
+            rates = self.mt5.copy_rates_range(resolved_symbol, tf_const, start, end)
             if rates is None:
-                raise RuntimeError(f"MT5 copy_rates_range failed for {symbol} {timeframe}: {self.mt5.last_error()}")
+                raise RuntimeError(
+                    f"MT5 copy_rates_range failed for {requested_symbol}/{resolved_symbol} {timeframe}: {self.mt5.last_error()}"
+                )
 
             candles: list[Candle] = []
             for row in rates:
                 candle_time = datetime.fromtimestamp(int(row["time"]), tz=timezone.utc)
                 candles.append(
                     Candle(
-                        symbol=symbol,
+                        symbol=requested_symbol,
                         timeframe=timeframe.upper(),
                         time_utc=candle_time,
                         open=float(row["open"]),
                         high=float(row["high"]),
                         low=float(row["low"]),
                         close=float(row["close"]),
+                        broker_symbol=resolved_symbol,
                         volume=float(row["tick_volume"]),
                     )
                 )

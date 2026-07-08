@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 
 from app.api.admin_gold import router as admin_gold_router
@@ -19,6 +22,7 @@ from app.api.billing import router as billing_router
 from app.api.health import router as health_router
 from app.api.ingest_mt5 import router as ingest_mt5_router
 from app.api.intel_gold import router as intel_gold_router
+from app.api.lce import router as lce_router
 from app.api.me import router as me_router
 from app.api.notifications import router as notifications_router
 from app.api.oracle import router as oracle_router
@@ -45,8 +49,6 @@ from app.core.middleware import (
 from app.services.oracle_scheduler import start_oracle_scheduler, stop_oracle_scheduler
 from app.services.stripe import validate_price_catalog
 
-load_dotenv()
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -65,6 +67,7 @@ def _all_routers():
         auth_router,
         me_router,
         billing_router,
+        lce_router,
         oracle_router,
         oracle_elite_router,
         oracle_mt5_router,
@@ -105,14 +108,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
     allow_credentials=settings.CORS_ALLOW_CREDENTIALS,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=[
-        "Authorization",
-        "Content-Type",
-        "X-Runner-Key",
-        "Stripe-Signature",
-        "X-Request-ID",
-    ],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.add_middleware(

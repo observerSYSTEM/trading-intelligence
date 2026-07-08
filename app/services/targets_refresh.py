@@ -9,13 +9,14 @@ from sqlalchemy.orm import Session
 from app.core.symbols import enabled_symbols_from_settings
 from app.core.time_utils import LONDON_TZ, LONDON_TZ_AVAILABLE
 from app.db.models import MT5Candle, MT5IngestStatus, OracleMagnetState, OracleTargetsSnapshot
-from app.services.data_provider import get_data_provider
+from app.services.data_provider import api_candle_mode, get_data_provider
 from app.services.telegram_alerts import latest_oracle_alert_context, maybe_send_liquidity_target_alert
 
 logger = logging.getLogger(__name__)
 
 EPS = 1e-9
 BROKER_OFFSET_CACHE_SECONDS: dict[str, int] = {}
+TARGETS_MARKET_FEED_DELAY_THRESHOLD_SECONDS = 10 * 60
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -31,6 +32,24 @@ def _safe_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _anchor_timeframe_delta(timeframe: str) -> timedelta:
+    mapping = {
+        "M1": timedelta(minutes=1),
+        "M5": timedelta(minutes=5),
+        "M15": timedelta(minutes=15),
+    }
+    return mapping[timeframe.strip().upper()]
+
+
+def _complete_candles(candles: list) -> list:
+    return [candle for candle in candles if bool(getattr(candle, "complete", True))]
+
+
+def _candle_contains_target(candle, *, timeframe: str, target_utc: datetime) -> bool:
+    candle_start = _as_utc(candle.time_utc)
+    return candle_start <= target_utc < candle_start + _anchor_timeframe_delta(timeframe)
 
 
 def get_cached_broker_offset_seconds(symbol: str) -> int | None:
@@ -56,6 +75,93 @@ def _latest_candles(db: Session, *, symbol: str, timeframe: str, limit: int) -> 
     )
     rows.reverse()
     return rows
+
+
+def latest_market_feed_freshness(
+    db: Session,
+    *,
+    symbol: str,
+    delay_threshold_seconds: int = TARGETS_MARKET_FEED_DELAY_THRESHOLD_SECONDS,
+    now_utc: datetime | None = None,
+) -> dict[str, Any]:
+    symbol_value = symbol.strip().upper()
+    current_utc = _as_utc(now_utc or datetime.now(timezone.utc))
+    threshold_seconds = max(int(delay_threshold_seconds), 30)
+
+    ingest_row = db.query(MT5IngestStatus).filter(MT5IngestStatus.symbol == symbol_value).first()
+    latest_candle = (
+        db.query(MT5Candle)
+        .filter(MT5Candle.symbol == symbol_value)
+        .order_by(MT5Candle.time_utc.desc(), MT5Candle.created_at.desc())
+        .first()
+    )
+
+    last_ingest_at = _as_utc(ingest_row.last_ingested_at) if ingest_row else None
+    latest_candle_time = _as_utc(latest_candle.time_utc) if latest_candle else None
+    latest_candle_timeframe = str(latest_candle.timeframe).upper() if latest_candle and latest_candle.timeframe else None
+    api_mode = api_candle_mode()
+    ingest_updated_at = (
+        _as_utc(ingest_row.updated_at)
+        if api_mode and ingest_row is not None and getattr(ingest_row, "updated_at", None) is not None
+        else None
+    )
+
+    latest_market_feed_at: datetime | None = None
+    latest_market_feed_source: str | None = None
+    if api_mode:
+        candidates: list[tuple[datetime, str]] = []
+        if ingest_updated_at:
+            candidates.append((ingest_updated_at, "ingest_status_updated_at"))
+        if last_ingest_at:
+            candidates.append((last_ingest_at, "ingest_status"))
+        if latest_candle_time:
+            candidates.append((latest_candle_time, f"latest_candle:{latest_candle_timeframe or 'UNKNOWN'}"))
+        if candidates:
+            latest_market_feed_at, latest_market_feed_source = max(candidates, key=lambda item: item[0])
+    elif last_ingest_at and latest_candle_time:
+        if last_ingest_at >= latest_candle_time:
+            latest_market_feed_at = last_ingest_at
+            latest_market_feed_source = "ingest_status"
+        else:
+            latest_market_feed_at = latest_candle_time
+            latest_market_feed_source = f"latest_candle:{latest_candle_timeframe or 'UNKNOWN'}"
+    elif last_ingest_at:
+        latest_market_feed_at = last_ingest_at
+        latest_market_feed_source = "ingest_status"
+    elif latest_candle_time:
+        latest_market_feed_at = latest_candle_time
+        latest_market_feed_source = f"latest_candle:{latest_candle_timeframe or 'UNKNOWN'}"
+
+    market_feed_age_seconds = (
+        max(int((current_utc - latest_market_feed_at).total_seconds()), 0)
+        if latest_market_feed_at is not None
+        else None
+    )
+    market_feed_delayed = (
+        True
+        if latest_market_feed_at is None
+        else bool(market_feed_age_seconds is not None and market_feed_age_seconds > threshold_seconds)
+    )
+    if latest_market_feed_at is None:
+        market_feed_delay_reason = "missing_market_feed"
+    elif market_feed_delayed:
+        market_feed_delay_reason = "freshness_threshold_exceeded"
+    else:
+        market_feed_delay_reason = None
+
+    return {
+        "symbol": symbol_value,
+        "last_ingest_at": last_ingest_at,
+        "ingest_updated_at": ingest_updated_at,
+        "latest_candle_time": latest_candle_time,
+        "latest_candle_timeframe": latest_candle_timeframe,
+        "latest_market_feed_at": latest_market_feed_at,
+        "latest_market_feed_source": latest_market_feed_source,
+        "market_feed_age_seconds": market_feed_age_seconds,
+        "market_feed_delayed": market_feed_delayed,
+        "market_feed_delay_reason": market_feed_delay_reason,
+        "market_feed_delay_threshold_seconds": threshold_seconds,
+    }
 
 
 def _atr_from_h1(candles: list[MT5Candle], period: int = 14) -> float | None:
@@ -131,8 +237,8 @@ def backfill_london_open_m1_window(
     *,
     symbol: str,
     date_uk: date,
-    minutes_before: int = 3,
-    minutes_after: int = 4,
+    minutes_before: int = 5,
+    minutes_after: int = 6,
 ) -> dict[str, Any]:
     symbol_value = symbol.strip().upper()
     if not LONDON_TZ_AVAILABLE:
@@ -148,6 +254,13 @@ def backfill_london_open_m1_window(
         }
 
     provider = get_data_provider()
+    provider_primary = getattr(getattr(provider, "primary", None), "name", getattr(provider, "name", None))
+    provider_fallback = getattr(getattr(provider, "fallback", None), "name", None)
+    api_mode = api_candle_mode()
+    anchor_provider = provider
+    primary_provider = getattr(provider, "primary", None)
+    if api_mode and primary_provider is not None and str(getattr(primary_provider, "name", "") or "").strip().lower() == "oanda":
+        anchor_provider = primary_provider
     window_start_local = datetime.combine(
         date_uk,
         time(hour=8, minute=1, tzinfo=LONDON_TZ),
@@ -160,44 +273,140 @@ def backfill_london_open_m1_window(
     window_end_utc = _as_utc(window_end_local)
     target_0801_utc = _as_utc(datetime.combine(date_uk, time(hour=8, minute=1, tzinfo=LONDON_TZ)))
 
+    anchor_timeframe = "M1"
+    anchor_candle_status: str | None = None
+    m1_candles_returned = 0
+    fetch_error: str | None = None
     try:
-        candles = provider.get_candles_range(
-            symbol=symbol_value,
-            timeframe="M1",
-            start_utc=window_start_utc,
-            end_utc=window_end_utc,
+        candles = _complete_candles(
+            anchor_provider.get_candles_range(
+                symbol=symbol_value,
+                timeframe="M1",
+                start_utc=window_start_utc,
+                end_utc=window_end_utc,
+            )
         )
+        m1_candles_returned = len(candles)
     except Exception as exc:
-        logger.exception(
-            "08:01 backfill failed symbol=%s date_uk=%s start=%s end=%s",
+        fetch_error = str(exc)
+        if not api_mode:
+            logger.exception(
+                "08:01 backfill failed symbol=%s date_uk=%s start=%s end=%s",
+                symbol_value,
+                date_uk.isoformat(),
+                window_start_utc.isoformat(),
+                window_end_utc.isoformat(),
+            )
+            return {
+                "ok": False,
+                "symbol": symbol_value,
+                "date_uk": date_uk.isoformat(),
+                "error": str(exc),
+                "window_start_utc": window_start_utc.isoformat(),
+                "window_end_utc": window_end_utc.isoformat(),
+                "target_0801_utc": target_0801_utc.isoformat(),
+                "candle_provider": provider_primary,
+                "fallback_provider": provider_fallback,
+                "anchor_candle_source": None,
+                "anchor_candle_status": "fetch_failed",
+                "found_0801": False,
+                "created": 0,
+                "updated": 0,
+            }
+        candles = []
+        logger.warning(
+            "api_anchor_lookup_m1_failed symbol=%s target_utc=%s provider=%s error=%s",
             symbol_value,
-            date_uk.isoformat(),
-            window_start_utc.isoformat(),
-            window_end_utc.isoformat(),
+            target_0801_utc.isoformat(),
+            provider_primary,
+            exc,
         )
-        return {
-            "ok": False,
-            "symbol": symbol_value,
-            "date_uk": date_uk.isoformat(),
-            "error": str(exc),
-            "window_start_utc": window_start_utc.isoformat(),
-            "window_end_utc": window_end_utc.isoformat(),
-            "target_0801_utc": target_0801_utc.isoformat(),
-            "found_0801": False,
-            "created": 0,
-            "updated": 0,
-        }
+
+    if api_mode:
+        exact_m1 = next((candle for candle in candles if _as_utc(candle.time_utc) == target_0801_utc), None)
+        if exact_m1 is None:
+            if fetch_error is None:
+                logger.warning(
+                    "api_anchor_lookup_m1_failed symbol=%s target_utc=%s count=%s provider=%s",
+                    symbol_value,
+                    target_0801_utc.isoformat(),
+                    m1_candles_returned,
+                    provider_primary,
+                )
+            fallback_selected = None
+            fallback_candles: list = []
+            for timeframe in ("M5", "M15"):
+                try:
+                    delta = _anchor_timeframe_delta(timeframe)
+                    candidate_candles = _complete_candles(
+                        anchor_provider.get_candles_range(
+                            symbol=symbol_value,
+                            timeframe=timeframe,
+                            start_utc=target_0801_utc - delta,
+                            end_utc=target_0801_utc + timedelta(seconds=1),
+                        )
+                    )
+                    candidate = next(
+                        (
+                            candle
+                            for candle in candidate_candles
+                            if _candle_contains_target(candle, timeframe=timeframe, target_utc=target_0801_utc)
+                        ),
+                        None,
+                    )
+                    if candidate is None:
+                        continue
+                    event_name = f"api_anchor_lookup_{timeframe.lower()}_fallback_ok"
+                    logger.info(
+                        "%s symbol=%s target_utc=%s candle_time_utc=%s provider=%s source=%s",
+                        event_name,
+                        symbol_value,
+                        target_0801_utc.isoformat(),
+                        _as_utc(candidate.time_utc).isoformat(),
+                        provider_primary,
+                        getattr(candidate, "source", None),
+                    )
+                    fallback_selected = candidate
+                    fallback_candles = candidate_candles
+                    anchor_timeframe = timeframe
+                    anchor_candle_status = f"{timeframe.lower()}_fallback_ok"
+                    break
+                except Exception:
+                    logger.exception(
+                        "08:01 API anchor fallback failed symbol=%s timeframe=%s target_utc=%s",
+                        symbol_value,
+                        timeframe,
+                        target_0801_utc.isoformat(),
+                    )
+            if fallback_selected is not None:
+                candles = fallback_candles
+        else:
+            anchor_candle_status = "found"
+    if api_mode and not candles and fetch_error and anchor_candle_status is None:
+        anchor_candle_status = "fetch_failed"
 
     created = 0
     updated = 0
     latest_ingested_at: datetime | None = None
     found_0801 = False
+    nearest_candle = None
+    if candles:
+        nearest_candle = min(
+            candles,
+            key=lambda candle: (abs((_as_utc(candle.time_utc) - target_0801_utc).total_seconds()), _as_utc(candle.time_utc)),
+        )
+    resolved_candle_symbol = (
+        str(candles[0].broker_symbol).strip()
+        if candles and getattr(candles[0], "broker_symbol", None)
+        else symbol_value
+    )
+    anchor_candle_source = str(getattr(candles[0], "source", "") or provider_primary or "").strip() if candles else None
     for candle in candles:
         candle_time = _as_utc(candle.time_utc)
         was_created = _upsert_candle(
             db,
             symbol=symbol_value,
-            timeframe="M1",
+            timeframe=anchor_timeframe,
             candle_time_utc=candle_time,
             open_=float(candle.open),
             high=float(candle.high),
@@ -210,8 +419,14 @@ def backfill_london_open_m1_window(
         else:
             updated += 1
         latest_ingested_at = candle_time if latest_ingested_at is None else max(latest_ingested_at, candle_time)
-        if candle_time == target_0801_utc:
+        if candle_time == target_0801_utc or (
+            api_mode and _candle_contains_target(candle, timeframe=anchor_timeframe, target_utc=target_0801_utc)
+        ):
             found_0801 = True
+
+    anchor_candle_status = anchor_candle_status or (
+        "found" if found_0801 else ("nearest_available" if nearest_candle is not None else "missing")
+    )
 
     if latest_ingested_at is not None:
         status_row = db.query(MT5IngestStatus).filter(MT5IngestStatus.symbol == symbol_value).first()
@@ -223,8 +438,9 @@ def backfill_london_open_m1_window(
             db.add(status_row)
 
     logger.info(
-        "08:01 backfill symbol=%s date_uk=%s candles=%s created=%s updated=%s found_0801=%s",
+        "08:01 backfill symbol=%s resolved_symbol=%s date_uk=%s candles=%s created=%s updated=%s found_0801=%s",
         symbol_value,
+        resolved_candle_symbol,
         date_uk.isoformat(),
         len(candles),
         created,
@@ -234,14 +450,30 @@ def backfill_london_open_m1_window(
     return {
         "ok": True,
         "symbol": symbol_value,
+        "requested_symbol": symbol_value,
+        "resolved_mt5_symbol": resolved_candle_symbol,
+        "resolved_candle_symbol": resolved_candle_symbol,
+        "candle_provider": provider_primary,
+        "fallback_provider": provider_fallback,
+        "anchor_candle_source": anchor_candle_source,
+        "anchor_candle_status": anchor_candle_status,
         "date_uk": date_uk.isoformat(),
         "window_start_utc": window_start_utc.isoformat(),
         "window_end_utc": window_end_utc.isoformat(),
         "target_0801_utc": target_0801_utc.isoformat(),
+        "anchor_timeframe": anchor_timeframe,
+        "fallback_timeframe": anchor_timeframe if anchor_timeframe != "M1" else None,
         "candles": len(candles),
+        "m1_candles_returned": m1_candles_returned,
         "created": created,
         "updated": updated,
         "found_0801": found_0801,
+        "nearest_available_candle_time": _as_utc(nearest_candle.time_utc).isoformat() if nearest_candle is not None else None,
+        "nearest_available_candle_delta_seconds": (
+            int(abs((_as_utc(nearest_candle.time_utc) - target_0801_utc).total_seconds()))
+            if nearest_candle is not None
+            else None
+        ),
     }
 
 
@@ -647,6 +879,7 @@ def refresh_targets_for_all_symbols(
     symbols: list[str] | None = None,
     reason: str,
     tiers: list[str] | None = None,
+    as_of_utc: datetime | None = None,
 ) -> list[dict[str, Any]]:
     target_symbols = symbols or enabled_symbols_from_settings()
     target_tiers = tiers or ["pro", "elite"]
@@ -654,7 +887,13 @@ def refresh_targets_for_all_symbols(
     for symbol in target_symbols:
         for tier in target_tiers:
             try:
-                row = recompute_targets_snapshot(db, symbol=symbol, tier=tier, reason=reason)
+                row = recompute_targets_snapshot(
+                    db,
+                    symbol=symbol,
+                    tier=tier,
+                    as_of_utc=as_of_utc,
+                    reason=reason,
+                )
                 results.append(
                     {
                         "ok": True,
@@ -685,6 +924,7 @@ def ingest_latest_candles(
     timeframes: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     provider = get_data_provider()
+    api_mode = api_candle_mode()
     target_symbols = symbols or enabled_symbols_from_settings()
     target_timeframes = [tf.strip().upper() for tf in (timeframes or ["M1"]) if tf and tf.strip()]
     if not target_timeframes:
@@ -719,8 +959,24 @@ def ingest_latest_candles(
                         "time_open_utc": candle_time.isoformat(),
                     }
                 )
+                if api_mode:
+                    logger.info(
+                        "api_candle_ingest_write_ok symbol=%s timeframe=%s candle_time_utc=%s source=%s created=%s",
+                        symbol_value,
+                        timeframe,
+                        candle_time.isoformat(),
+                        getattr(candle, "source", None) or getattr(provider, "name", "api"),
+                        created,
+                    )
             except Exception as exc:
                 logger.exception("market ingest failed symbol=%s timeframe=%s", symbol_value, timeframe)
+                if api_mode:
+                    logger.warning(
+                        "api_candle_ingest_write_failed symbol=%s timeframe=%s error=%s",
+                        symbol_value,
+                        timeframe,
+                        exc,
+                    )
                 results.append({"ok": False, "symbol": symbol_value, "timeframe": timeframe, "error": str(exc)})
 
         if latest_symbol_time is not None:
@@ -742,7 +998,13 @@ def ingest_latest_candles(
                     status_row.last_ingested_at = latest_symbol_time
                 db.add(status_row)
 
-    logger.info("market ingest run completed symbols=%s timeframes=%s", len(target_symbols), ",".join(target_timeframes))
+    successful_symbols = sorted({str(item.get("symbol") or "") for item in results if item.get("ok") and item.get("symbol")})
+    logger.info(
+        "market ingest run completed requested_symbols=%s successful_symbols=%s timeframes=%s",
+        ",".join(target_symbols),
+        ",".join(successful_symbols),
+        ",".join(target_timeframes),
+    )
     return results
 
 

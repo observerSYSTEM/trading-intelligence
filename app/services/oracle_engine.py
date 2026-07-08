@@ -9,12 +9,16 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.symbols import default_configured_symbol
 from app.db.models import MT5Candle
 from app.services.h4_session_modifier import apply_h4_session_flip_modifier
 from app.services.manipulation_m15 import detect_manipulation_m15
-from app.services.time_service import TimeService
+from app.services.time_service import DailyPermissionTimeWindow, TimeService
 
 logger = logging.getLogger(__name__)
+DAILY_PERMISSION_LOOKUP_MINUTES_BEFORE = 5
+DAILY_PERMISSION_LOOKUP_MINUTES_AFTER = 6
+DAILY_PERMISSION_NEAREST_TOLERANCE_SECONDS = 60
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -83,6 +87,191 @@ def _latest_closed_candles(db: Session, symbol: str, timeframe: str, limit: int)
     )
     rows.reverse()
     return rows
+
+
+def _nearest_candle_with_delta(
+    candles: list[MT5Candle],
+    *,
+    target_utc: datetime,
+) -> tuple[MT5Candle | None, int | None]:
+    if not candles:
+        return None, None
+
+    selected = min(
+        candles,
+        key=lambda row: (
+            abs((_as_utc(row.time_utc) - target_utc).total_seconds()),
+            0 if _as_utc(row.time_utc) >= target_utc else 1,
+            _as_utc(row.time_utc),
+        ),
+    )
+    delta_seconds = int(abs((_as_utc(selected.time_utc) - target_utc).total_seconds()))
+    return selected, delta_seconds
+
+
+def inspect_daily_permission_0801_lookup(
+    db: Session,
+    *,
+    symbol: str,
+    window: DailyPermissionTimeWindow,
+    resolved_mt5_symbol: str | None = None,
+) -> dict:
+    symbol_value = symbol.strip().upper()
+    direct_candidates = (
+        db.query(MT5Candle)
+        .filter(
+            MT5Candle.symbol == symbol_value,
+            MT5Candle.timeframe == "M1",
+            MT5Candle.time_utc >= window.search_start_utc,
+            MT5Candle.time_utc < window.search_end_utc,
+        )
+        .order_by(MT5Candle.time_utc.asc(), MT5Candle.created_at.asc())
+        .all()
+    )
+    broker_candidates = (
+        db.query(MT5Candle)
+        .filter(
+            MT5Candle.symbol == symbol_value,
+            MT5Candle.timeframe == "M1",
+            MT5Candle.time_utc >= window.search_start_broker_utc,
+            MT5Candle.time_utc < window.search_end_broker_utc,
+        )
+        .order_by(MT5Candle.time_utc.asc(), MT5Candle.created_at.asc())
+        .all()
+    )
+
+    direct_exact = next(
+        (row for row in direct_candidates if _as_utc(row.time_utc) == window.target_london_0801_utc),
+        None,
+    )
+    broker_exact = next(
+        (row for row in broker_candidates if _as_utc(row.time_utc) == window.expected_0801_broker_utc),
+        None,
+    )
+    direct_nearest, direct_nearest_delta = _nearest_candle_with_delta(
+        direct_candidates,
+        target_utc=window.target_london_0801_utc,
+    )
+    broker_nearest, broker_nearest_delta = _nearest_candle_with_delta(
+        broker_candidates,
+        target_utc=window.expected_0801_broker_utc,
+    )
+
+    selected_row: MT5Candle | None = None
+    selected_source = "none"
+    selected_delta_seconds: int | None = None
+    if direct_exact is not None:
+        selected_row = direct_exact
+        selected_source = "utc_exact"
+        selected_delta_seconds = 0
+    elif broker_exact is not None:
+        selected_row = broker_exact
+        selected_source = "broker_exact"
+        selected_delta_seconds = 0
+    elif direct_nearest is not None and direct_nearest_delta is not None and direct_nearest_delta <= DAILY_PERMISSION_NEAREST_TOLERANCE_SECONDS:
+        selected_row = direct_nearest
+        selected_source = "utc_nearest_within_tolerance"
+        selected_delta_seconds = direct_nearest_delta
+    elif broker_nearest is not None and broker_nearest_delta is not None and broker_nearest_delta <= DAILY_PERMISSION_NEAREST_TOLERANCE_SECONDS:
+        selected_row = broker_nearest
+        selected_source = "broker_nearest_within_tolerance"
+        selected_delta_seconds = broker_nearest_delta
+
+    nearest_candidates: list[tuple[MT5Candle, int, str]] = []
+    if direct_nearest is not None and direct_nearest_delta is not None:
+        nearest_candidates.append((direct_nearest, direct_nearest_delta, "utc_window"))
+    if broker_nearest is not None and broker_nearest_delta is not None:
+        nearest_candidates.append((broker_nearest, broker_nearest_delta, "broker_window"))
+
+    nearest_row: MT5Candle | None = None
+    nearest_delta_seconds: int | None = None
+    nearest_source: str | None = None
+    if nearest_candidates:
+        nearest_row, nearest_delta_seconds, nearest_source = min(
+            nearest_candidates,
+            key=lambda item: (
+                item[1],
+                0 if item[2] == "utc_window" else 1,
+                0 if _as_utc(item[0].time_utc) >= window.target_london_0801_utc else 1,
+                _as_utc(item[0].time_utc),
+            ),
+        )
+        if selected_row is None and nearest_delta_seconds is not None:
+            selected_source = "nearest_outside_tolerance"
+
+    resolved_symbol_value = (
+        (resolved_mt5_symbol or "").strip()
+        or next((str(row.symbol).strip() for row in direct_candidates + broker_candidates if str(row.symbol).strip()), "")
+        or symbol_value
+    )
+
+    return {
+        "requested_symbol": symbol_value,
+        "resolved_mt5_symbol": resolved_symbol_value,
+        "target_utc": window.target_london_0801_utc,
+        "target_broker_utc": window.expected_0801_broker_utc,
+        "search_start_utc": window.search_start_utc,
+        "search_end_utc": window.search_end_utc,
+        "search_start_broker_utc": window.search_start_broker_utc,
+        "search_end_broker_utc": window.search_end_broker_utc,
+        "direct_candidates": direct_candidates,
+        "broker_candidates": broker_candidates,
+        "selected_row": selected_row,
+        "selected_source": selected_source,
+        "selected_delta_seconds": selected_delta_seconds,
+        "selection_tolerance_seconds": DAILY_PERMISSION_NEAREST_TOLERANCE_SECONDS,
+        "nearest_row": nearest_row,
+        "nearest_source": nearest_source,
+        "nearest_delta_seconds": nearest_delta_seconds,
+    }
+
+
+def _serialize_daily_permission_lookup_debug(lookup: dict) -> dict:
+    search_end_utc = lookup["search_end_utc"] - timedelta(minutes=1)
+    search_end_broker_utc = lookup["search_end_broker_utc"] - timedelta(minutes=1)
+    selected_row = lookup.get("selected_row")
+    nearest_row = lookup.get("nearest_row")
+    direct_candidates = lookup.get("direct_candidates") or []
+    broker_candidates = lookup.get("broker_candidates") or []
+    unique_candidate_keys = {
+        (
+            str(getattr(row, "symbol", "") or "").strip(),
+            str(getattr(row, "timeframe", "") or "").strip(),
+            _as_utc(row.time_utc).isoformat(),
+        )
+        for row in direct_candidates + broker_candidates
+    }
+    total_unique_candidates = len(unique_candidate_keys)
+
+    return {
+        "requested_symbol": lookup.get("requested_symbol"),
+        "resolved_mt5_symbol": lookup.get("resolved_mt5_symbol"),
+        "lookup_start_utc": lookup["search_start_utc"].isoformat(),
+        "lookup_end_utc": search_end_utc.isoformat(),
+        "lookup_start_broker_utc": lookup["search_start_broker_utc"].isoformat(),
+        "lookup_end_broker_utc": search_end_broker_utc.isoformat(),
+        "search_start_utc": lookup["search_start_utc"].isoformat(),
+        "search_end_utc": search_end_utc.isoformat(),
+        "search_start_broker_utc": lookup["search_start_broker_utc"].isoformat(),
+        "search_end_broker_utc": search_end_broker_utc.isoformat(),
+        "candidate_count_utc_window": len(direct_candidates),
+        "candidate_count_broker_window": len(broker_candidates),
+        "candidate_count_total": total_unique_candidates,
+        "m1_candles_returned_utc_window": len(direct_candidates),
+        "m1_candles_returned_broker_window": len(broker_candidates),
+        "m1_candles_returned_total": total_unique_candidates,
+        "nearest_available_candle_time": _as_utc(nearest_row.time_utc).isoformat() if nearest_row is not None else None,
+        "nearest_available_candle_time_london": _as_utc(nearest_row.time_utc).astimezone(UK_TZ).isoformat()
+        if nearest_row is not None
+        else None,
+        "nearest_available_candle_source": lookup.get("nearest_source"),
+        "nearest_available_candle_delta_seconds": lookup.get("nearest_delta_seconds"),
+        "selection_source": lookup.get("selected_source"),
+        "selection_tolerance_seconds": lookup.get("selection_tolerance_seconds"),
+        "selected_time_delta_seconds": lookup.get("selected_delta_seconds"),
+        "exact_match_selected": str(lookup.get("selected_source") or "").endswith("_exact"),
+        "actual_candle_found_time": _as_utc(selected_row.time_utc).isoformat() if selected_row is not None else None,
+    }
 
 
 @dataclass
@@ -579,7 +768,8 @@ def direction_for_tier(permission: PermissionDecisionResult, plan: str) -> str:
     return permission.allowed_direction_final_soft
 
 
-def compute_hourly_candidate(db: Session, symbol: str = "XAUUSD") -> CandidateResult:
+def compute_hourly_candidate(db: Session, symbol: str | None = None) -> CandidateResult:
+    symbol = (symbol or default_configured_symbol()).strip().upper()
     timeframe_used = "H1"
     candles: list[MT5Candle] = []
     for timeframe in ("H1", "M15", "M1"):
@@ -1202,65 +1392,36 @@ def compute_daily_permission_from_m1(
         )
 
     date_uk, _target_utc_unused = _daily_permission_target_utc(ref_utc=now_utc)
-    window = TimeService.daily_permission_window_for_date(db, symbol=symbol, for_date_uk=date_uk)
+    window = TimeService.daily_permission_window_for_date(
+        db,
+        symbol=symbol,
+        for_date_uk=date_uk,
+        minutes_before=DAILY_PERMISSION_LOOKUP_MINUTES_BEFORE,
+        minutes_after=DAILY_PERMISSION_LOOKUP_MINUTES_AFTER,
+    )
     target_utc = window.target_london_0801_utc
     broker_offset_seconds = window.broker_offset_seconds
     target_broker_utc = window.expected_0801_broker_utc
     search_start_broker_utc = window.search_start_broker_utc
     search_end_broker_utc = window.search_end_broker_utc
-
-    # Primary selection: DB candle timestamps are authoritative UTC.
-    search_start_utc = target_utc - timedelta(minutes=3)
-    search_end_utc = target_utc + timedelta(minutes=5) + timedelta(minutes=1)
-    direct_candidates = (
-        db.query(MT5Candle)
-        .filter(
-            MT5Candle.symbol == symbol,
-            MT5Candle.timeframe == "M1",
-            MT5Candle.time_utc >= search_start_utc,
-            MT5Candle.time_utc < search_end_utc,
-        )
-        .order_by(MT5Candle.time_utc.asc(), MT5Candle.created_at.asc())
-        .all()
-    )
-
-    # Fallback selection for legacy rows where broker-mapped timestamps were persisted.
-    broker_candidates: list[MT5Candle] = []
-    if not direct_candidates:
-        broker_candidates = (
-            db.query(MT5Candle)
-            .filter(
-                MT5Candle.symbol == symbol,
-                MT5Candle.timeframe == "M1",
-                MT5Candle.time_utc >= search_start_broker_utc,
-                MT5Candle.time_utc < search_end_broker_utc,
-            )
-            .order_by(MT5Candle.time_utc.asc(), MT5Candle.created_at.asc())
-            .all()
-        )
-
-    m1_0801: MT5Candle | None = None
-    selected_source = "none"
-    if direct_candidates:
-        m1_0801 = min(
-            direct_candidates,
-            key=lambda row: abs((_as_utc(row.time_utc) - target_utc).total_seconds()),
-        )
-        selected_source = "utc_window"
-    elif broker_candidates:
-        m1_0801 = min(
-            broker_candidates,
-            key=lambda row: abs((_as_utc(row.time_utc) - target_broker_utc).total_seconds()),
-        )
-        selected_source = "broker_window"
+    search_start_utc = window.search_start_utc
+    search_end_utc = window.search_end_utc
+    lookup = inspect_daily_permission_0801_lookup(db, symbol=symbol, window=window)
+    direct_candidates = lookup["direct_candidates"]
+    broker_candidates = lookup["broker_candidates"]
+    m1_0801 = lookup["selected_row"]
+    selected_source = str(lookup["selected_source"] or "none")
+    lookup_debug = _serialize_daily_permission_lookup_debug(lookup)
     logger.info(
-        "daily permission 0801 lookup symbol=%s date_uk=%s target_utc=%s selection=%s utc_candidates=%s broker_candidates=%s",
+        "daily permission 0801 lookup symbol=%s resolved_symbol=%s date_uk=%s target_utc=%s selection=%s utc_candidates=%s broker_candidates=%s nearest=%s",
         symbol,
+        lookup_debug.get("resolved_mt5_symbol"),
         date_uk.isoformat(),
         target_utc.isoformat(),
         selected_source,
         len(direct_candidates),
         len(broker_candidates),
+        lookup_debug.get("nearest_available_candle_time"),
     )
 
     local_now = now_utc.astimezone(UK_TZ)
@@ -1298,13 +1459,7 @@ def compute_daily_permission_from_m1(
                 "broker_offset_hours": round(float(broker_offset_seconds) / 3600.0, 4),
                 "broker_server_time_utc": TimeService.latest_server_utc(db, symbol=symbol).isoformat(),
                 "actual_candle_found_time": None,
-                "selection_source": selected_source,
-                "search_start_utc": search_start_utc.isoformat(),
-                "search_end_utc": (search_end_utc - timedelta(minutes=1)).isoformat(),
-                "search_start_broker_utc": search_start_broker_utc.isoformat(),
-                "search_end_broker_utc": (search_end_broker_utc - timedelta(minutes=1)).isoformat(),
-                "candidate_count_utc_window": len(direct_candidates),
-                "candidate_count_broker_window": len(broker_candidates),
+                **lookup_debug,
                 "now_utc": now_utc.isoformat(),
                 "now_london": local_now.isoformat(),
                 "missing_data": True,
@@ -1317,7 +1472,7 @@ def compute_daily_permission_from_m1(
         )
 
     candle_as_of_raw = _as_utc(m1_0801.time_utc)
-    if selected_source == "broker_window" and broker_offset_seconds:
+    if selected_source.startswith("broker_") and broker_offset_seconds:
         candle_as_of_utc = candle_as_of_raw - timedelta(seconds=broker_offset_seconds)
     else:
         candle_as_of_utc = candle_as_of_raw
@@ -1347,13 +1502,7 @@ def compute_daily_permission_from_m1(
                 "broker_offset_seconds": broker_offset_seconds,
                 "broker_offset_hours": round(float(broker_offset_seconds) / 3600.0, 4),
                 "broker_server_time_utc": TimeService.latest_server_utc(db, symbol=symbol).isoformat(),
-                "selection_source": selected_source,
-                "search_start_utc": search_start_utc.isoformat(),
-                "search_end_utc": (search_end_utc - timedelta(minutes=1)).isoformat(),
-                "search_start_broker_utc": search_start_broker_utc.isoformat(),
-                "search_end_broker_utc": (search_end_broker_utc - timedelta(minutes=1)).isoformat(),
-                "candidate_count_utc_window": len(direct_candidates),
-                "candidate_count_broker_window": len(broker_candidates),
+                **lookup_debug,
                 "future_timestamp": True,
                 "permission_date": date_uk.isoformat(),
                 "permission_candle_close_utc": candle_as_of_utc.isoformat(),
@@ -1409,13 +1558,7 @@ def compute_daily_permission_from_m1(
             "broker_offset_seconds": broker_offset_seconds,
             "broker_offset_hours": round(float(broker_offset_seconds) / 3600.0, 4),
             "broker_server_time_utc": TimeService.latest_server_utc(db, symbol=symbol).isoformat(),
-            "selection_source": selected_source,
-            "search_start_utc": search_start_utc.isoformat(),
-            "search_end_utc": (search_end_utc - timedelta(minutes=1)).isoformat(),
-            "search_start_broker_utc": search_start_broker_utc.isoformat(),
-            "search_end_broker_utc": (search_end_broker_utc - timedelta(minutes=1)).isoformat(),
-            "candidate_count_utc_window": len(direct_candidates),
-            "candidate_count_broker_window": len(broker_candidates),
+            **lookup_debug,
             "open": open_,
             "close": close,
             "range": vol,

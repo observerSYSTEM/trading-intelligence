@@ -4,8 +4,21 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-from app.core.symbols import ALL_SYMBOLS, allowed_symbols_for_tier, normalize_plan
+from app.core.symbols import ALL_SYMBOLS, allowed_symbols_for_tier, configured_symbols_from_settings, normalize_plan
 from app.db.models import UserSignalPref, UserSymbolPreference
+
+
+def _default_enabled_symbols_for_tier(tier: str, available: list[str]) -> list[str]:
+    if tier == "basic":
+        return ["XAUUSD"] if "XAUUSD" in available else ([available[0]] if available else [])
+    if tier == "elite":
+        preferred = ["XAUUSD", "GBPJPY"]
+        selected = [symbol for symbol in preferred if symbol in available]
+        if selected:
+            return selected
+    if "XAUUSD" in available:
+        return ["XAUUSD"]
+    return [available[0]] if available else []
 
 
 def normalize_symbols(values: list[str] | None) -> tuple[list[str], list[str]]:
@@ -30,8 +43,9 @@ def normalize_symbols(values: list[str] | None) -> tuple[list[str], list[str]]:
 def available_and_locked(plan: str | None) -> tuple[list[str], list[str]]:
     tier = normalize_plan(plan)
     allowed = allowed_symbols_for_tier(tier)
-    available = [symbol for symbol in ALL_SYMBOLS if symbol in allowed]
-    locked = [symbol for symbol in ALL_SYMBOLS if symbol not in allowed]
+    configured = configured_symbols_from_settings()
+    available = [symbol for symbol in configured if symbol in allowed]
+    locked = [symbol for symbol in configured if symbol not in allowed]
     return available, locked
 
 
@@ -41,7 +55,7 @@ def get_user_enabled_symbols(db: Session, user_id, plan: str | None) -> list[str
 
     # Basic always has XAUUSD enabled.
     if tier == "basic":
-        return ["XAUUSD"]
+        return _default_enabled_symbols_for_tier(tier, available)
 
     signal_pref = db.query(UserSignalPref).filter(UserSignalPref.user_id == user_id).first()
     if signal_pref and isinstance(signal_pref.symbols_json, list):
@@ -65,9 +79,7 @@ def get_user_enabled_symbols(db: Session, user_id, plan: str | None) -> list[str
     selected = [row.symbol for row in rows if row.enabled and row.symbol in available]
     if selected:
         return selected
-    if "XAUUSD" in available:
-        return ["XAUUSD"]
-    return [available[0]] if available else []
+    return _default_enabled_symbols_for_tier(tier, available)
 
 
 def get_user_symbol_preferences_payload(db: Session, user_id, plan: str | None) -> dict:
@@ -87,7 +99,7 @@ def get_user_symbol_preferences_payload(db: Session, user_id, plan: str | None) 
                 "enabled": symbol in enabled,
                 "locked": symbol in locked_set,
             }
-            for symbol in ALL_SYMBOLS
+            for symbol in available + locked
         ],
     }
 

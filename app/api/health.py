@@ -9,9 +9,10 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user, require_admin
 from app.core.config import settings
 from app.core.rate_limit import RateLimitRule, rate_limit
-from app.core.symbols import enabled_symbols_from_settings
-from app.db.models import MT5Candle, RunnerStatus, User
+from app.core.symbols import default_configured_symbol, enabled_symbols_from_settings
+from app.db.models import MT5Candle, MT5IngestStatus, RunnerStatus, User
 from app.db.session import get_db
+from app.services.data_provider import api_candle_mode, candle_provider_debug_labels, get_data_provider
 from app.services.runner_control import fetch_runner_health
 from app.services.targets_refresh import market_health_rows
 
@@ -26,25 +27,64 @@ def _as_utc(value: datetime) -> datetime:
 
 @router.get("/health/ingest")
 def ingest_health(
-    symbol: str = settings.ORACLE_SYMBOL,
+    symbol: str | None = None,
     timeframe: str = settings.ORACLE_TIMEFRAME,
     stale_after_seconds: int = 180,
     db: Session = Depends(get_db),
     _admin: User = Depends(require_admin),
     _limit: None = rate_limit("health_ingest", (RateLimitRule(limit=60, window_seconds=60),)),
 ):
+    symbol_value = (symbol or default_configured_symbol()).strip().upper()
     row = (
         db.query(MT5Candle)
-        .filter(MT5Candle.symbol == symbol, MT5Candle.timeframe == timeframe)
+        .filter(MT5Candle.symbol == symbol_value, MT5Candle.timeframe == timeframe)
         .order_by(MT5Candle.time_utc.desc(), MT5Candle.created_at.desc())
         .first()
     )
+
+    if api_candle_mode():
+        try:
+            provider = get_data_provider()
+            candle = provider.get_latest_closed_candle(symbol=symbol_value, timeframe=timeframe)
+            candle_time_utc = _as_utc(candle.time_utc)
+            now_utc = datetime.now(timezone.utc)
+            age_seconds = max(int((now_utc - candle_time_utc).total_seconds()), 0)
+            is_stale = age_seconds > stale_after_seconds
+            return {
+                "ok": not is_stale,
+                "status": "stale" if is_stale else "fresh",
+                "symbol": symbol_value,
+                "timeframe": timeframe,
+                "last_candle_time_utc": candle_time_utc.isoformat(),
+                "age_seconds": age_seconds,
+                "stale_after_seconds": stale_after_seconds,
+                "api_mode": True,
+                **candle_provider_debug_labels(
+                    latest_candle_source=getattr(candle, "source", None),
+                    last_candle_time=candle_time_utc.isoformat(),
+                    anchor_candle_source=None,
+                    anchor_candle_status=None,
+                ),
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "status": "provider_error",
+                "symbol": symbol_value,
+                "timeframe": timeframe,
+                "last_candle_time_utc": None,
+                "age_seconds": None,
+                "stale_after_seconds": stale_after_seconds,
+                "api_mode": True,
+                "error": str(exc),
+                **candle_provider_debug_labels(),
+            }
 
     if not row:
         return {
             "ok": False,
             "status": "no_data",
-            "symbol": symbol,
+            "symbol": symbol_value,
             "timeframe": timeframe,
             "last_candle_time_utc": None,
             "age_seconds": None,
@@ -114,6 +154,55 @@ def health_runner(
     _limit: None = rate_limit("health_runner", (RateLimitRule(limit=120, window_seconds=60),)),
 ):
     now_utc = datetime.now(timezone.utc)
+    if api_candle_mode():
+        symbol = default_configured_symbol()
+        stale_after_seconds = max(int(settings.RUNNER_HEARTBEAT_STALE_SECONDS or 180), 30)
+        ingest_row = db.query(MT5IngestStatus).filter(MT5IngestStatus.symbol == symbol).first()
+        latest_candle = (
+            db.query(MT5Candle)
+            .filter(MT5Candle.symbol == symbol)
+            .order_by(MT5Candle.time_utc.desc(), MT5Candle.created_at.desc())
+            .first()
+        )
+        last_ingest = None
+        if ingest_row is not None:
+            last_ingest_value = getattr(ingest_row, "updated_at", None) or ingest_row.last_ingested_at
+            last_ingest = _as_utc(last_ingest_value)
+        latest_candle_time = _as_utc(latest_candle.time_utc) if latest_candle else None
+        lag_seconds = max(int((now_utc - last_ingest).total_seconds()), 0) if last_ingest else None
+        provider_connected = bool(last_ingest is not None and lag_seconds is not None and lag_seconds <= stale_after_seconds)
+        return {
+            "ok": provider_connected,
+            "mode": "api",
+            "api_mode": True,
+            "provider_connected": provider_connected,
+            "mt5_connected": False,
+            "mt5_initialized": None,
+            "mt5_logged_in": None,
+            "last_tick_utc": None,
+            "last_ingest_utc": last_ingest.isoformat() if last_ingest else None,
+            "lag_seconds": lag_seconds,
+            "symbols_ok": [symbol] if provider_connected else [],
+            "symbols": {},
+            "account": None,
+            "terminal": None,
+            "server_time_utc": now_utc.isoformat(),
+            "last_error": None if provider_connected else "API candle ingest is stale or missing.",
+            "runner_control_configured": False,
+            "runner_control_ok": None,
+            "runner_control_error": None,
+            "runner_control_warning": None,
+            "runner_control_url": None,
+            "runner_ok": provider_connected,
+            "items": [],
+            **candle_provider_debug_labels(
+                latest_candle_source=(settings.CANDLE_PROVIDER or "api").strip().lower(),
+                last_candle_time=latest_candle_time.isoformat() if latest_candle_time else None,
+                anchor_candle_source=None,
+                anchor_candle_status=None,
+            ),
+        }
+
     rows = db.query(RunnerStatus).order_by(RunnerStatus.updated_at.desc()).all()
     remote = fetch_runner_health()
     remote_data = remote.get("data") if isinstance(remote.get("data"), dict) else {}

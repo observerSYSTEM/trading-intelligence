@@ -10,10 +10,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.db.base import Base
-from app.db.models import MT5Candle, OracleTargetsSnapshot
+from app.db.models import MT5Candle, MT5IngestStatus, OracleTargetsSnapshot
 from app.services.targets_refresh import (
     detect_magnet_hit,
+    latest_market_feed_freshness,
     maybe_refresh_targets_on_magnet_hit,
+    refresh_targets_for_all_symbols,
     recompute_targets_snapshot,
 )
 
@@ -70,6 +72,128 @@ def _seed_m1_price(db: Session, symbol: str, *, now_utc: datetime, close: float)
 
 
 class TargetsRefreshTests(unittest.TestCase):
+    def test_latest_market_feed_freshness_prefers_newer_ingest_timestamp(self):
+        with test_db() as db:
+            symbol = "XAUUSD"
+            candle_time = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+            ingest_time = candle_time + timedelta(minutes=3)
+            now_utc = ingest_time + timedelta(minutes=1)
+
+            db.add(
+                MT5Candle(
+                    symbol=symbol,
+                    timeframe="M15",
+                    time_utc=candle_time,
+                    open=2300.0,
+                    high=2301.0,
+                    low=2299.5,
+                    close=2300.5,
+                    volume=1000.0,
+                )
+            )
+            db.add(MT5IngestStatus(symbol=symbol, last_ingested_at=ingest_time))
+            db.commit()
+
+            with patch("app.services.targets_refresh.api_candle_mode", return_value=False):
+                freshness = latest_market_feed_freshness(db, symbol=symbol, now_utc=now_utc)
+
+            self.assertEqual(freshness["latest_market_feed_source"], "ingest_status")
+            self.assertEqual(freshness["latest_market_feed_at"], ingest_time)
+            self.assertEqual(freshness["market_feed_age_seconds"], 60)
+            self.assertFalse(freshness["market_feed_delayed"])
+
+    def test_api_market_feed_freshness_uses_ingest_status_updated_at(self):
+        with test_db() as db:
+            symbol = "XAUUSD"
+            candle_time = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+            ingest_updated_at = candle_time + timedelta(minutes=14)
+            now_utc = ingest_updated_at + timedelta(minutes=1)
+
+            db.add(
+                MT5Candle(
+                    symbol=symbol,
+                    timeframe="M15",
+                    time_utc=candle_time,
+                    open=2300.0,
+                    high=2301.0,
+                    low=2299.5,
+                    close=2300.5,
+                    volume=1000.0,
+                )
+            )
+            db.add(
+                MT5IngestStatus(
+                    symbol=symbol,
+                    last_ingested_at=candle_time,
+                    updated_at=ingest_updated_at,
+                )
+            )
+            db.commit()
+
+            with patch("app.services.targets_refresh.api_candle_mode", return_value=True):
+                freshness = latest_market_feed_freshness(db, symbol=symbol, now_utc=now_utc)
+
+            self.assertEqual(freshness["latest_market_feed_source"], "ingest_status_updated_at")
+            self.assertEqual(freshness["latest_market_feed_at"], ingest_updated_at)
+            self.assertEqual(freshness["market_feed_age_seconds"], 60)
+            self.assertFalse(freshness["market_feed_delayed"])
+
+    def test_latest_market_feed_freshness_falls_back_to_latest_candle(self):
+        with test_db() as db:
+            symbol = "EURUSD"
+            candle_time = datetime(2026, 5, 1, 9, 58, tzinfo=timezone.utc)
+            now_utc = candle_time + timedelta(minutes=1)
+
+            db.add(
+                MT5Candle(
+                    symbol=symbol,
+                    timeframe="M1",
+                    time_utc=candle_time,
+                    open=1.08,
+                    high=1.081,
+                    low=1.0795,
+                    close=1.0805,
+                    volume=500.0,
+                )
+            )
+            db.commit()
+
+            with patch("app.services.targets_refresh.api_candle_mode", return_value=False):
+                freshness = latest_market_feed_freshness(db, symbol=symbol, now_utc=now_utc)
+
+            self.assertEqual(freshness["latest_market_feed_source"], "latest_candle:M1")
+            self.assertEqual(freshness["latest_market_feed_at"], candle_time)
+            self.assertEqual(freshness["latest_candle_timeframe"], "M1")
+            self.assertFalse(freshness["market_feed_delayed"])
+
+    def test_refresh_targets_for_all_symbols_uses_explicit_as_of_timestamp(self):
+        with test_db() as db:
+            symbol = "GBPJPY"
+            history_now = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+            refresh_as_of = history_now + timedelta(minutes=4)
+            _seed_h1_history(db, symbol, now_utc=history_now)
+            _seed_m1_price(db, symbol, now_utc=history_now, close=195.25)
+            db.commit()
+
+            rows = refresh_targets_for_all_symbols(
+                db,
+                symbols=[symbol],
+                reason="manual_run",
+                tiers=["pro"],
+                as_of_utc=refresh_as_of,
+            )
+            db.commit()
+
+            self.assertEqual(rows[0]["as_of_utc"], refresh_as_of.isoformat())
+            latest = (
+                db.query(OracleTargetsSnapshot)
+                .filter(OracleTargetsSnapshot.symbol == symbol, OracleTargetsSnapshot.tier == "pro")
+                .order_by(OracleTargetsSnapshot.as_of_utc.desc(), OracleTargetsSnapshot.created_at.desc())
+                .first()
+            )
+            self.assertIsNotNone(latest)
+            self.assertEqual(latest.as_of_utc.replace(tzinfo=timezone.utc), refresh_as_of)
+
     def test_detect_magnet_hit_buy_and_sell(self):
         buy_hit = detect_magnet_hit(
             magnet_side="BUY",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -40,10 +41,23 @@ class MT5Client:
         if not ok:
             raise RuntimeError(f"MT5 initialize failed: {self._mt5.last_error()}")
 
+        account = self._mt5.account_info()
+        if account is not None:
+            print(json.dumps({"event": "mt5_attached_existing_session"}), flush=True)
+            self._connected = True
+            return
+
+        if not (
+            self.settings.mt5_login is not None
+            and self.settings.mt5_password
+            and self.settings.mt5_server
+        ):
+            raise RuntimeError(f"MT5 login failed: {self._mt5.last_error()}")
+
         login_ok = self._mt5.login(
-            login=int(self.settings.mt5_login or 0),
-            password=str(self.settings.mt5_password or ""),
-            server=str(self.settings.mt5_server or ""),
+            login=int(self.settings.mt5_login),
+            password=str(self.settings.mt5_password),
+            server=str(self.settings.mt5_server),
         )
         if not login_ok:
             raise RuntimeError(f"MT5 login failed: {self._mt5.last_error()}")
@@ -220,4 +234,3 @@ def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
-

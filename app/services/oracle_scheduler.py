@@ -15,7 +15,7 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
 from app.core.config import settings
-from app.core.symbols import enabled_symbols_from_settings, normalize_plan
+from app.core.symbols import configured_symbol_config, default_configured_symbol, enabled_symbols_from_settings, normalize_plan
 from app.core.time_utils import LONDON_TZ, LONDON_TZ_AVAILABLE, london_now, now_utc
 from app.db.models import (
     DailyPermissionSnapshot,
@@ -42,7 +42,7 @@ from app.db.models import (
 )
 from app.db.session import SessionLocal
 from app.schemas.signal import SignalCreate
-from app.services.data_provider import get_data_provider
+from app.services.data_provider import api_candle_mode, configured_provider_name, get_data_provider
 from app.services.oracle_engine import (
     OpportunityResult,
     compute_prelim_permission_from_asia,
@@ -83,8 +83,10 @@ from app.services.trade_tracker import (
 from app.services.trade_validation import validate_trade_payload
 from app.services.usage_service import UsageLimitExceeded, consume_usage, get_usage
 from app.services.targets_refresh import (
+    TARGETS_MARKET_FEED_DELAY_THRESHOLD_SECONDS,
     backfill_london_open_m1_window,
     ingest_latest_candles,
+    latest_market_feed_freshness,
     latest_magnet_state,
     maybe_refresh_targets_on_magnet_hit,
     refresh_targets_for_all_symbols,
@@ -240,7 +242,7 @@ def _ensure_daily_permission_snapshot(db, *, symbol: str, ref_utc: datetime | No
     missing = bool(factors.get("missing_data"))
     if missing:
         runner_row = db.query(RunnerStatus).order_by(RunnerStatus.updated_at.desc()).first()
-        if runner_row is not None and not bool(runner_row.mt5_connected):
+        if not api_candle_mode() and runner_row is not None and not bool(runner_row.mt5_connected):
             runner_error = (runner_row.last_error or "Runner MT5 disconnected.").strip()
             backfill_result = {
                 "ok": False,
@@ -2608,8 +2610,24 @@ def _ingest_oracle_source_candles(db, *, symbol: str, timeframes: tuple[str, ...
                     "created": created,
                 }
             )
+            if api_candle_mode():
+                logger.info(
+                    "api_candle_ingest_write_ok symbol=%s timeframe=%s candle_time_utc=%s source=%s created=%s",
+                    symbol_value,
+                    tf,
+                    candle_time.isoformat(),
+                    getattr(candle, "source", None) or getattr(provider, "name", "api"),
+                    created,
+                )
         except Exception as exc:
             logger.exception("oracle source ingest failed symbol=%s timeframe=%s", symbol_value, tf)
+            if api_candle_mode():
+                logger.warning(
+                    "api_candle_ingest_write_failed symbol=%s timeframe=%s error=%s",
+                    symbol_value,
+                    tf,
+                    exc,
+                )
             results.append({"ok": False, "symbol": symbol_value, "timeframe": tf, "error": str(exc)})
 
     if latest_ingested_at is not None:
@@ -2694,7 +2712,7 @@ def _create_candidate_run(db, symbol: str) -> OracleRun:
 
 
 def run_oracle_hourly_job(symbol: str | None = None, *, dispatch_signals: bool = False) -> dict:
-    symbol_value = (symbol or settings.ORACLE_SYMBOL or "XAUUSD").upper()
+    symbol_value = (symbol or default_configured_symbol()).strip().upper()
     with SessionLocal() as db:
         ingest = _ingest_oracle_source_candles(db, symbol=symbol_value, timeframes=("M1", "M15", "H1"))
         permission_row, backfill_result = _ensure_daily_permission_snapshot(db, symbol=symbol_value)
@@ -2743,6 +2761,24 @@ def run_oracle_hourly_job(symbol: str | None = None, *, dispatch_signals: bool =
         except Exception:
             logger.exception("weekly range compute failed symbol=%s as_of=%s", symbol_value, _as_utc(opp.as_of_utc).isoformat())
 
+        try:
+            targets_market_feed = latest_market_feed_freshness(db, symbol=symbol_value)
+            targets_refresh_as_of = targets_market_feed.get("latest_market_feed_at") or _as_utc(opp.as_of_utc)
+        except Exception:
+            logger.exception("manual run targets market feed lookup failed symbol=%s", symbol_value)
+            targets_refresh_as_of = _as_utc(opp.as_of_utc)
+            fallback_age_seconds = max(int((datetime.now(timezone.utc) - targets_refresh_as_of).total_seconds()), 0)
+            targets_market_feed = {
+                "latest_market_feed_at": targets_refresh_as_of,
+                "latest_market_feed_source": "manual_run_fallback",
+                "last_ingest_at": None,
+                "latest_candle_time": None,
+                "latest_candle_timeframe": None,
+                "market_feed_age_seconds": fallback_age_seconds,
+                "market_feed_delayed": fallback_age_seconds > TARGETS_MARKET_FEED_DELAY_THRESHOLD_SECONDS,
+                "market_feed_delay_reason": "freshness_lookup_failed",
+                "market_feed_delay_threshold_seconds": TARGETS_MARKET_FEED_DELAY_THRESHOLD_SECONDS,
+            }
         if opp.public_json.get("atr_h1") is None or opp.public_json.get("adr_d1") is None:
             logger.warning(
                 "risk stats missing symbol=%s atr_h1=%s adr_d1=%s",
@@ -2751,7 +2787,29 @@ def run_oracle_hourly_job(symbol: str | None = None, *, dispatch_signals: bool =
                 opp.public_json.get("adr_d1"),
             )
         run = _opportunity_to_oracle_run(db, opp=opp)
-        refresh_targets_for_all_symbols(db, symbols=[symbol_value], reason="manual_run", tiers=["pro", "elite"])
+        targets_refresh = refresh_targets_for_all_symbols(
+            db,
+            symbols=[symbol_value],
+            reason="manual_run",
+            tiers=["pro", "elite"],
+            as_of_utc=targets_refresh_as_of,
+        )
+        logger.info(
+            "manual run targets refresh symbol=%s refresh_as_of=%s latest_market_feed_at=%s latest_ingest_at=%s "
+            "latest_candle_time=%s latest_candle_timeframe=%s source=%s delayed=%s",
+            symbol_value,
+            _as_utc(targets_refresh_as_of).isoformat(),
+            targets_market_feed.get("latest_market_feed_at").isoformat()
+            if targets_market_feed.get("latest_market_feed_at")
+            else None,
+            targets_market_feed.get("last_ingest_at").isoformat() if targets_market_feed.get("last_ingest_at") else None,
+            targets_market_feed.get("latest_candle_time").isoformat()
+            if targets_market_feed.get("latest_candle_time")
+            else None,
+            targets_market_feed.get("latest_candle_timeframe"),
+            targets_market_feed.get("latest_market_feed_source"),
+            targets_market_feed.get("market_feed_delayed"),
+        )
         db.commit()
         delivery = {"sent": 0, "failed": 0, "skipped": 0, "considered": 0}
         if dispatch_signals and opp.final_allowed in {"BUY_ONLY", "SELL_ONLY"}:
@@ -2769,6 +2827,30 @@ def run_oracle_hourly_job(symbol: str | None = None, *, dispatch_signals: bool =
             "dispatch_signals": dispatch_signals,
             "ingest": ingest,
             "daily_permission_backfill": backfill_result,
+            "targets_refresh": targets_refresh,
+            "targets_market_feed": {
+                "latest_market_feed_at_utc": (
+                    targets_market_feed.get("latest_market_feed_at").isoformat()
+                    if targets_market_feed.get("latest_market_feed_at")
+                    else None
+                ),
+                "latest_market_feed_source": targets_market_feed.get("latest_market_feed_source"),
+                "latest_ingest_at_utc": (
+                    targets_market_feed.get("last_ingest_at").isoformat()
+                    if targets_market_feed.get("last_ingest_at")
+                    else None
+                ),
+                "latest_candle_time_utc": (
+                    targets_market_feed.get("latest_candle_time").isoformat()
+                    if targets_market_feed.get("latest_candle_time")
+                    else None
+                ),
+                "latest_candle_timeframe": targets_market_feed.get("latest_candle_timeframe"),
+                "market_feed_age_seconds": targets_market_feed.get("market_feed_age_seconds"),
+                "market_feed_delayed": targets_market_feed.get("market_feed_delayed"),
+                "market_feed_delay_reason": targets_market_feed.get("market_feed_delay_reason"),
+                "market_feed_delay_threshold_seconds": targets_market_feed.get("market_feed_delay_threshold_seconds"),
+            },
             "delivery": delivery,
         }
 
@@ -2780,6 +2862,11 @@ def run_oracle_for_symbols(symbols: list[str], *, dispatch_signals: bool = False
         if symbol and symbol not in normalized:
             normalized.append(symbol)
 
+    logger.info(
+        "oracle multi-symbol run symbols=%s dispatch_signals=%s",
+        ",".join(normalized),
+        dispatch_signals,
+    )
     results: list[dict] = []
     for symbol in normalized:
         try:
@@ -3160,7 +3247,71 @@ def run_m15_opportunity_all_symbols_job() -> dict:
     return {"ok": True, "items": rows}
 
 
+def _payload_item_count(payload, key: str | None = None) -> int:
+    if isinstance(payload, list):
+        return len(payload)
+    if isinstance(payload, dict) and key:
+        value = payload.get(key)
+        if isinstance(value, list):
+            return len(value)
+    return 0
+
+
+def _run_finnhub_news_ingest_job() -> dict:
+    try:
+        from runner.providers.finnhub_provider import FinnhubProvider
+
+        from_date = now_utc().date()
+        to_date = from_date + timedelta(days=7)
+        provider = FinnhubProvider(api_key=settings.FINNHUB_API_KEY)
+        economic_calendar = provider.get_economic_calendar(from_date, to_date)
+        market_news = provider.get_market_news(category="general")
+        forex_news = provider.get_forex_news_or_general_news()
+
+        calendar_count = _payload_item_count(economic_calendar, "economicCalendar")
+        market_news_count = _payload_item_count(market_news)
+        forex_news_count = _payload_item_count(forex_news)
+        logger.info(
+            "finnhub market/news ingest run completed calendar_events=%s market_news=%s forex_news=%s",
+            calendar_count,
+            market_news_count,
+            forex_news_count,
+        )
+        return {
+            "ok": True,
+            "provider": "finnhub",
+            "skipped_mt5": True,
+            "from_date": from_date.isoformat(),
+            "to_date": to_date.isoformat(),
+            "calendar_events": calendar_count,
+            "market_news_count": market_news_count,
+            "forex_news_count": forex_news_count,
+            "economic_calendar": economic_calendar,
+            "market_news": market_news,
+            "forex_news": forex_news,
+        }
+    except Exception as exc:
+        if "FINNHUB_API_KEY is required" in str(exc):
+            logger.warning("finnhub news/calendar ingest skipped: %s", exc)
+        else:
+            logger.exception("finnhub news/calendar ingest failed")
+        return {
+            "ok": False,
+            "provider": "finnhub",
+            "skipped_mt5": True,
+            "error": str(exc),
+        }
+
+
+def _run_finnhub_market_ingest_job() -> dict:
+    return _run_finnhub_news_ingest_job()
+
+
 def run_market_ingest_job(*, timeframes: list[str] | tuple[str, ...] | None = None) -> dict:
+    provider_name = configured_provider_name()
+    if provider_name == "finnhub":
+        return _run_finnhub_news_ingest_job()
+
     normalized_timeframes = [str(tf).strip().upper() for tf in (timeframes or ["M1"]) if str(tf).strip()]
     if not normalized_timeframes:
         normalized_timeframes = ["M1"]
@@ -3283,12 +3434,17 @@ def run_market_ingest_job(*, timeframes: list[str] | tuple[str, ...] | None = No
                 fail_count,
                 len(compute_runs),
             )
+            news_calendar = None
+            if provider_name in {"api", "twelvedata"} and (settings.NEWS_PROVIDER or "").strip().lower() == "finnhub":
+                news_calendar = _run_finnhub_news_ingest_job()
             return {
                 "ok": fail_count == 0,
+                "provider": provider_name,
                 "timeframes": normalized_timeframes,
                 "ingested": ok_count,
                 "failed": fail_count,
                 "items": results,
+                "news_calendar": news_calendar,
                 "magnet_updates": magnet_updates,
                 "compute_runs": compute_runs,
                 "compute_candidates": sorted(symbols_for_compute.keys()),
@@ -3318,7 +3474,7 @@ def run_london_open_backfill_job() -> dict:
     rows: list[dict] = []
     with SessionLocal() as db:
         runner_row = db.query(RunnerStatus).order_by(RunnerStatus.updated_at.desc()).first()
-        if runner_row is not None and not bool(runner_row.mt5_connected):
+        if not api_candle_mode() and runner_row is not None and not bool(runner_row.mt5_connected):
             reason = (runner_row.last_error or "Runner MT5 disconnected.").strip()
             logger.warning("08:01 backfill skipped: runner mt5 disconnected error=%s", reason)
             return {
@@ -3702,6 +3858,7 @@ def start_oracle_scheduler() -> None:
     with _lock:
         if _scheduler and _scheduler.running:
             return
+        symbol_config = configured_symbol_config()
         scheduler = BackgroundScheduler(timezone=UK_TZ)
         if settings.MARKET_INGEST_HEARTBEAT_ENABLED:
             scheduler.add_job(
@@ -3850,7 +4007,13 @@ def start_oracle_scheduler() -> None:
         )
         scheduler.start()
         _scheduler = scheduler
-        logger.info("Oracle scheduler started timezone=%s", UK_TZ)
+        logger.info(
+            "Oracle scheduler started timezone=%s resolved_path=%s raw_symbols=%s parsed_symbols=%s",
+            UK_TZ,
+            symbol_config.resolved_path,
+            symbol_config.raw_env_value,
+            ",".join(symbol_config.symbols),
+        )
         _recover_pending_confirmations()
 
 

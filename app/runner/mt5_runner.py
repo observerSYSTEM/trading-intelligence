@@ -13,6 +13,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import requests
 from dotenv import load_dotenv
 
+from app.core.symbols import (
+    configured_symbol_map_from_env,
+    parse_symbol_map_json,
+    resolve_mt5_broker_symbol,
+    runner_symbol_config,
+)
+
 load_dotenv()
 
 DEFAULT_TIMEFRAMES = ("M1", "M15", "H1")
@@ -97,32 +104,22 @@ def _parse_timeframes() -> list[str]:
     return out or list(DEFAULT_TIMEFRAMES)
 
 
+def _resolve_symbol_config() -> dict[str, object]:
+    config = runner_symbol_config()
+    return {
+        "symbols": list(config.symbols),
+        "raw_env_value": config.raw_env_value,
+        "resolved_path": config.resolved_path,
+        "used_fallback": config.used_fallback,
+    }
+
+
 def _parse_symbols() -> list[str]:
-    raw = os.getenv("RUNNER_SYMBOLS") or os.getenv("ORACLE_ENABLED_SYMBOLS") or "XAUUSD"
-    out: list[str] = []
-    for part in raw.split(","):
-        symbol = part.strip().upper()
-        if symbol and symbol not in out:
-            out.append(symbol)
-    return out or ["XAUUSD"]
+    return list(_resolve_symbol_config()["symbols"])
 
 
 def _parse_symbol_map(raw: str | None) -> dict[str, str]:
-    if not raw or not raw.strip():
-        return {}
-    try:
-        data = json.loads(raw)
-    except Exception:
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    out: dict[str, str] = {}
-    for key, value in data.items():
-        k = str(key).strip().upper()
-        v = str(value).strip()
-        if k and v:
-            out[k] = v
-    return out
+    return parse_symbol_map_json(raw)
 
 
 def _required_env(name: str) -> str:
@@ -538,40 +535,23 @@ class MT5Manager:
         return True
 
     def _resolve_broker_symbol(self, symbol: str) -> str:
-        key = symbol.strip().upper()
-        if key in self._broker_symbols:
-            cached = self._broker_symbols[key]
-            if self.mt5.symbol_select(cached, True):
-                return cached
-
-        tried: list[str] = []
-        candidates: list[str] = []
-        mapped = self.symbol_map.get(key)
-        if mapped:
-            candidates.append(mapped)
-        candidates.extend([key, f"{key}m", f"{key}.m", f"{key}.", f"{key}_"])
-        for candidate in candidates:
-            if candidate in tried:
-                continue
-            tried.append(candidate)
-            if self.mt5.symbol_select(candidate, True):
-                self._broker_symbols[key] = candidate
-                return candidate
-
         try:
-            matches = self.mt5.symbols_get(f"{key}*") or []
-        except Exception:
-            matches = []
-        for match in matches:
-            name = str(getattr(match, "name", "")).strip()
-            if not name or name in tried:
-                continue
-            tried.append(name)
-            if self.mt5.symbol_select(name, True):
-                self._broker_symbols[key] = name
-                return name
-
-        raise RuntimeError(f"symbol_select failed for {key}: {self._last_error_text()} tried={tried}")
+            return resolve_mt5_broker_symbol(
+                self.mt5,
+                symbol,
+                symbol_map=self.symbol_map,
+                cache=self._broker_symbols,
+                on_resolve=lambda payload: _emit(
+                    "runner.mt5.symbol_resolved",
+                    {
+                        "requested_symbol": payload.get("requested_symbol"),
+                        "broker_symbol": payload.get("resolved_symbol"),
+                        "resolution_source": payload.get("resolution_source"),
+                    },
+                ),
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(f"{exc}") from exc
 
     def _timeframe_value(self, tf: str) -> int:
         mapping = {
@@ -692,9 +672,12 @@ def _send_heartbeat(
 
 def run_forever() -> None:
     cfg = _validate_env()
-    symbols = _parse_symbols()
+    symbol_config = _resolve_symbol_config()
+    symbols = list(symbol_config["symbols"])
     timeframes = _parse_timeframes()
-    symbol_map = _parse_symbol_map(os.getenv("RUNNER_SYMBOL_MAP_JSON"))
+    symbol_map = configured_symbol_map_from_env(
+        env_sources=("RUNNER_SYMBOL_MAP_JSON", "MT5_SYMBOL_MAP_JSON"),
+    )
     state = RunnerState(symbols=symbols)
     mt5 = MT5Manager(
         state=state,
@@ -720,11 +703,22 @@ def run_forever() -> None:
         )
 
     _emit(
+        "runner.symbols.config",
+        {
+            "raw_env_value": symbol_config["raw_env_value"],
+            "symbols": symbols,
+            "resolved_path": symbol_config["resolved_path"],
+            "used_fallback": bool(symbol_config["used_fallback"]),
+        },
+    )
+
+    _emit(
         "runner.started",
         {
             "runner_id": cfg["runner_id"],
             "api_base": cfg["api_base"],
             "symbols": symbols,
+            "symbols_resolved_path": symbol_config["resolved_path"],
             "timeframes": timeframes,
             "loop_seconds": cfg["loop_seconds"],
             "heartbeat_seconds": cfg["heartbeat_seconds"],

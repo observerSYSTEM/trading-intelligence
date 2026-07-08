@@ -1274,6 +1274,7 @@ def detect_london_fvg(
 
 def evaluate_setup_readiness(
     *,
+    symbol: str,
     anchor_summary: dict,
     sweep_summary: dict,
     magnet_summary: dict,
@@ -1340,7 +1341,7 @@ def evaluate_setup_readiness(
             "setup_state": "none",
             "setup_confidence": 0,
             "setup_score": 0,
-            "setup_reason": "No actionable GBPJPY setup context is available.",
+            "setup_reason": f"No actionable {symbol} setup context is available.",
             "blocking_factors": [],
             "confirming_factors": [],
             "entry_context_summary": (
@@ -1356,7 +1357,7 @@ def evaluate_setup_readiness(
             "setup_state": "conflicted",
             "setup_confidence": bullish_score,
             "setup_score": 0,
-            "setup_reason": "GBPJPY context is mixed and lacks a dominant directional bias.",
+            "setup_reason": f"{symbol} context is mixed and lacks a dominant directional bias.",
             "blocking_factors": passive_blockers + [f"conflict:{item}" for item in confirming["bullish"] + confirming["bearish"]],
             "confirming_factors": [],
             "entry_context_summary": (
@@ -1395,15 +1396,15 @@ def evaluate_setup_readiness(
     elif dominant_score >= 70 and aligned_fvg:
         setup_state = "ready"
         setup_available = True
-        setup_reason = f"{setup_direction.title()} GBPJPY setup is ready with aligned structure and FVG."
+        setup_reason = f"{setup_direction.title()} {symbol} setup is ready with aligned structure and FVG."
     elif dominant_score >= 45:
         setup_state = "developing"
         setup_available = True
-        setup_reason = f"{setup_direction.title()} GBPJPY setup is developing but not fully confirmed."
+        setup_reason = f"{setup_direction.title()} {symbol} setup is developing but not fully confirmed."
     else:
         setup_state = "none"
         setup_available = False
-        setup_reason = "GBPJPY context is too weak to qualify as a setup."
+        setup_reason = f"{symbol} context is too weak to qualify as a setup."
 
     return {
         "setup_available": setup_available,
@@ -1546,6 +1547,7 @@ def get_symbol_session_context(
         config=config,
     )
     setup_summary = evaluate_setup_readiness(
+        symbol=symbol_value,
         anchor_summary=anchor_summary,
         sweep_summary=sweep_summary,
         magnet_summary=magnet_summary,

@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from app.core.symbols import configured_symbol_config
 from app.services.oracle_scheduler import start_oracle_scheduler, stop_oracle_scheduler
 
 logger = logging.getLogger("app.worker.oracle_worker")
@@ -29,7 +30,13 @@ def main() -> None:
     stop_event = threading.Event()
     _register_signal_handlers(stop_event)
 
-    logger.info("Starting oracle worker scheduler process.")
+    symbol_config = configured_symbol_config()
+    logger.info(
+        "Starting oracle worker scheduler process resolved_path=%s raw_symbols=%s parsed_symbols=%s",
+        symbol_config.resolved_path,
+        symbol_config.raw_env_value,
+        ",".join(symbol_config.symbols),
+    )
     start_oracle_scheduler()
 
     try:

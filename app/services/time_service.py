@@ -13,6 +13,8 @@ from app.db.models import MT5IngestStatus
 class DailyPermissionTimeWindow:
     date_uk: date
     target_london_0801_utc: datetime
+    search_start_utc: datetime
+    search_end_utc: datetime
     broker_offset_seconds: int
     expected_0801_broker_utc: datetime
     search_start_broker_utc: datetime
@@ -49,24 +51,26 @@ class TimeService:
         *,
         symbol: str,
         for_date_uk: date,
-        minutes_before: int = 3,
-        minutes_after: int = 4,
+        minutes_before: int = 5,
+        minutes_after: int = 6,
     ) -> DailyPermissionTimeWindow:
         london_target_utc = london_0801_utc(for_date_uk)
+        search_start_utc = london_target_utc - timedelta(minutes=max(int(minutes_before), 0))
+        search_end_utc = london_target_utc + timedelta(minutes=max(int(minutes_after), 0)) + timedelta(minutes=1)
         offset_seconds = TimeService.broker_offset_seconds(db, symbol=symbol)
         offset_delta = timedelta(seconds=offset_seconds)
         expected_broker_utc = london_target_utc + offset_delta
-        search_start_utc = (london_target_utc - timedelta(minutes=max(int(minutes_before), 0))) + offset_delta
-        search_end_utc = (london_target_utc + timedelta(minutes=max(int(minutes_after), 0))) + offset_delta + timedelta(
-            minutes=1
-        )
+        search_start_broker_utc = search_start_utc + offset_delta
+        search_end_broker_utc = search_end_utc + offset_delta
         return DailyPermissionTimeWindow(
             date_uk=for_date_uk,
             target_london_0801_utc=london_target_utc,
+            search_start_utc=search_start_utc,
+            search_end_utc=search_end_utc,
             broker_offset_seconds=offset_seconds,
             expected_0801_broker_utc=expected_broker_utc,
-            search_start_broker_utc=search_start_utc,
-            search_end_broker_utc=search_end_utc,
+            search_start_broker_utc=search_start_broker_utc,
+            search_end_broker_utc=search_end_broker_utc,
         )
 
     @staticmethod

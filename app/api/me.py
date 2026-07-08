@@ -10,6 +10,10 @@ from app.services.symbol_preferences import get_user_enabled_symbols
 
 router = APIRouter(tags=["me"])
 
+
+def _is_admin_user(user: User) -> bool:
+    return (getattr(user, "role", "") or "").strip().lower() == "admin"
+
 @router.get("/me")
 def me(
     user: User = Depends(get_current_user),
@@ -18,15 +22,16 @@ def me(
 ):
     sub = db.query(Subscription).filter(Subscription.user_id == user.id).first()
 
-    tier = (sub.plan if sub else "basic") or "basic"
-    status = (sub.status if sub else "inactive") or "inactive"
-
     # Ensure a subscription row always exists
     if not sub:
         sub = Subscription(user_id=user.id, plan="basic", status="inactive")
         db.add(sub)
         db.commit()
         db.refresh(sub)
+
+    is_admin = _is_admin_user(user)
+    tier = "elite" if is_admin else ((sub.plan if sub else "basic") or "basic")
+    status = "active" if is_admin else ((sub.status if sub else "inactive") or "inactive")
 
     symbols_available = allowed_symbols_for_plan(tier)
     symbols_enabled = get_user_enabled_symbols(db, user.id, tier)

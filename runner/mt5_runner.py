@@ -10,6 +10,15 @@ import requests
 from dotenv import load_dotenv
 
 
+def _env_bool(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _mt5_disabled() -> bool:
+    provider = (os.getenv("DATA_PROVIDER") or os.getenv("MARKET_DATA_PROVIDER") or "mt5").strip().lower()
+    return _env_bool(os.getenv("DISABLE_MT5")) or provider == "finnhub"
+
+
 def _load_mt5():
     try:
         import MetaTrader5 as mt5  # type: ignore
@@ -128,6 +137,14 @@ def _fetch_last_closed_candle():
 
 def main() -> int:
     load_dotenv()
+
+    if _mt5_disabled():
+        print(
+            "ERROR: MT5 is disabled. Use runner/mt5_runner_ingest.py or "
+            "scripts/test_finnhub_provider.py for Finnhub market/news data.",
+            file=sys.stderr,
+        )
+        return 2
 
     app_url = (os.getenv("APP_URL") or "http://127.0.0.1:8000").rstrip("/")
     runner_key = os.getenv("RUNNER_API_KEY") or ""
