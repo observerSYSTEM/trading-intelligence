@@ -25,6 +25,7 @@ from app.api.intel_gold import router as intel_gold_router
 from app.api.lce import router as lce_router
 from app.api.me import router as me_router
 from app.api.notifications import router as notifications_router
+from app.api.observer import router as observer_router
 from app.api.oracle import router as oracle_router
 from app.api.oracle_elite import router as oracle_elite_router
 from app.api.oracle_mt5 import router as oracle_mt5_router
@@ -68,6 +69,7 @@ def _all_routers():
         me_router,
         billing_router,
         lce_router,
+        observer_router,
         oracle_router,
         oracle_elite_router,
         oracle_mt5_router,
