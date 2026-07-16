@@ -1,0 +1,16 @@
+[Unit]
+Description=Trading Intelligence SaaS Docker Compose stack
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/observer/trading-intelligence-saas
+RemainAfterExit=yes
+ExecStart=/usr/bin/docker compose -f docker-compose.pi.yml up -d
+ExecStop=/usr/bin/docker compose -f docker-compose.pi.yml stop trading_intelligence_frontend trading_intelligence_worker trading_intelligence_api trading_intelligence_redis trading_intelligence_postgres
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

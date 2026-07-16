@@ -1,0 +1,160 @@
+name: trading_intelligence_saas
+
+services:
+  trading_intelligence_postgres:
+    image: postgres:16-alpine
+    container_name: trading_intelligence_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-trading_intelligence}
+      POSTGRES_USER: ${POSTGRES_USER:-trading_intelligence}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_this_trading_intelligence_password}
+    volumes:
+      - trading_intelligence_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - trading_intelligence_network
+
+  trading_intelligence_redis:
+    image: redis:7-alpine
+    container_name: trading_intelligence_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - trading_intelligence_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - trading_intelligence_network
+
+  trading_intelligence_migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile.pi.api
+    container_name: trading_intelligence_migrate
+    restart: "no"
+    env_file:
+      - .env
+    environment:
+      DATA_PROVIDER: api
+      MARKET_DATA_PROVIDER: api
+      DISABLE_MT5: "true"
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://${POSTGRES_USER:-trading_intelligence}:${POSTGRES_PASSWORD:-change_this_trading_intelligence_password}@trading_intelligence_postgres:5432/${POSTGRES_DB:-trading_intelligence}}
+      REDIS_URL: ${REDIS_URL:-redis://trading_intelligence_redis:6379/0}
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      trading_intelligence_postgres:
+        condition: service_healthy
+    networks:
+      - trading_intelligence_network
+
+  trading_intelligence_api:
+    build:
+      context: .
+      dockerfile: Dockerfile.pi.api
+    container_name: trading_intelligence_api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATA_PROVIDER: api
+      MARKET_DATA_PROVIDER: api
+      DISABLE_MT5: "true"
+      ORACLE_SCHEDULER_IN_API: "false"
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://${POSTGRES_USER:-trading_intelligence}:${POSTGRES_PASSWORD:-change_this_trading_intelligence_password}@trading_intelligence_postgres:5432/${POSTGRES_DB:-trading_intelligence}}
+      REDIS_URL: ${REDIS_URL:-redis://trading_intelligence_redis:6379/0}
+    ports:
+      - "8100:8000"
+    depends_on:
+      trading_intelligence_postgres:
+        condition: service_healthy
+      trading_intelligence_redis:
+        condition: service_healthy
+      trading_intelligence_migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import json, urllib.request; data=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)); raise SystemExit(0 if data.get('ok') else 1)",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - trading_intelligence_network
+
+  trading_intelligence_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.pi.api
+    container_name: trading_intelligence_worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATA_PROVIDER: api
+      MARKET_DATA_PROVIDER: api
+      DISABLE_MT5: "true"
+      API_BASE: http://trading_intelligence_api:8000
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://${POSTGRES_USER:-trading_intelligence}:${POSTGRES_PASSWORD:-change_this_trading_intelligence_password}@trading_intelligence_postgres:5432/${POSTGRES_DB:-trading_intelligence}}
+      REDIS_URL: ${REDIS_URL:-redis://trading_intelligence_redis:6379/0}
+      RUNNER_INTERVAL_SECONDS: ${RUNNER_INTERVAL_SECONDS:-60}
+    command: ["python", "-m", "runner.mt5_runner_ingest"]
+    depends_on:
+      trading_intelligence_api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python - <<'PY'\nimport os, sys\nsys.exit(0 if os.getenv('DISABLE_MT5', '').lower() == 'true' and os.getenv('DATA_PROVIDER') == 'api' else 1)\nPY"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+    networks:
+      - trading_intelligence_network
+
+  trading_intelligence_frontend:
+    build:
+      context: ./trading-ui
+      dockerfile: Dockerfile.pi
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://PI_TAILSCALE_IP:8100}
+    container_name: trading_intelligence_frontend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://PI_TAILSCALE_IP:8100}
+    ports:
+      - "3100:3100"
+    depends_on:
+      trading_intelligence_api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3100').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - trading_intelligence_network
+
+volumes:
+  trading_intelligence_postgres_data:
+  trading_intelligence_redis_data:
+
+networks:
+  trading_intelligence_network:
+    driver: bridge

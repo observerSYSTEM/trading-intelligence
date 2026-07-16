@@ -13,6 +13,7 @@ runtime/
 .env
 .env.*
 !.env.example
+!.env.pi.example
 
 # Local databases
 local.db
